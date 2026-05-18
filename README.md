@@ -1,10 +1,21 @@
 # 4D Map
 
+## Roadmap
+
+TODO: validate 4d map representation and losses in **ManiSkill** (on task **StackCube-v1** first).
+
+- [ ] 4d map representation, including losses (```4dmap/4dmap_representation/4dmaps```)
+- [ ] 4d map construction (```4dmap/4dmap_construction```)
+- [ ] 4d map encoder (```4dmap/4dmap_encoder```)
+- [ ] insert into baselines, like dp and act
+
 ## benckmark
 
 ### ManiSkill
 
 Data Collection:
+
+**Remember to change paths.**
 
 ```bash
 python -m mani_skill.examples.motionplanning.panda.run -h
