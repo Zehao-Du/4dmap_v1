@@ -121,8 +121,43 @@ def reorder_keys(d, ref_dict):
     return out
 
 
+def is_control_mode_compatible(dataset_control_mode, target_control_mode):
+    if dataset_control_mode == target_control_mode:
+        return True
+    return (
+        dataset_control_mode == "pd_ee_delta_pose"
+        and target_control_mode == "pd_ee_delta_pos"
+    )
+
+
+def convert_actions_for_control_mode(actions, dataset_control_mode, target_control_mode):
+    if dataset_control_mode == target_control_mode:
+        return actions
+    if dataset_control_mode == "pd_ee_delta_pose" and target_control_mode == "pd_ee_delta_pos":
+        if actions.shape[1] < 4:
+            raise ValueError(
+                f"Cannot convert pd_ee_delta_pose actions with shape {actions.shape} "
+                "to pd_ee_delta_pos"
+            )
+        return np.concatenate([actions[:, :3], actions[:, -1:]], axis=1)
+    raise ValueError(
+        f"Unsupported control mode conversion from {dataset_control_mode} to {target_control_mode}"
+    )
+
+
 class SmallDemoDataset_DiffusionPolicy(Dataset):  # Load everything into memory
-    def __init__(self, data_path, obs_process_fn, obs_space, include_rgb, include_depth, device, num_traj):
+    def __init__(
+        self,
+        data_path,
+        obs_process_fn,
+        obs_space,
+        include_rgb,
+        include_depth,
+        device,
+        num_traj,
+        dataset_control_mode,
+        target_control_mode,
+    ):
         self.include_rgb = include_rgb
         self.include_depth = include_depth
         from diffusion_policy.utils import load_demo_dataset
@@ -154,8 +189,18 @@ class SmallDemoDataset_DiffusionPolicy(Dataset):  # Load everything into memory
         self.obs_keys = list(_obs_traj_dict.keys())
         # Pre-process the actions
         for i in range(len(trajectories["actions"])):
+            trajectories["actions"][i] = convert_actions_for_control_mode(
+                trajectories["actions"][i],
+                dataset_control_mode,
+                target_control_mode,
+            )
             trajectories["actions"][i] = torch.Tensor(trajectories["actions"][i]).to(
                 device=device
+            )
+        if dataset_control_mode != target_control_mode:
+            print(
+                f"Converted actions from {dataset_control_mode} to {target_control_mode}; "
+                f"action dim is now {trajectories['actions'][0].shape[1]}."
             )
         print(
             "Obs/action pre-processing is done, start to pre-compute the slice indices..."
@@ -414,9 +459,12 @@ if __name__ == "__main__":
                 control_mode = demo_info["episodes"][0]["control_mode"]
             else:
                 raise Exception("Control mode not found in json")
-            assert (
-                control_mode == args.control_mode
-            ), f"Control mode mismatched. Dataset has control mode {control_mode}, but args has control mode {args.control_mode}"
+            assert is_control_mode_compatible(control_mode, args.control_mode), (
+                f"Control mode mismatched. Dataset has control mode {control_mode}, "
+                f"but args has control mode {args.control_mode}"
+            )
+    else:
+        control_mode = args.control_mode
     assert args.obs_horizon + args.act_horizon - 1 <= args.pred_horizon
     assert args.obs_horizon >= 1 and args.act_horizon >= 1 and args.pred_horizon >= 1
 
@@ -494,7 +542,9 @@ if __name__ == "__main__":
         include_rgb=include_rgb,
         include_depth=include_depth,
         device=device,
-        num_traj=args.num_demos
+        num_traj=args.num_demos,
+        dataset_control_mode=control_mode,
+        target_control_mode=args.control_mode,
     )
     sampler = RandomSampler(dataset, replacement=False)
     batch_sampler = BatchSampler(sampler, batch_size=args.batch_size, drop_last=True)

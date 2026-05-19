@@ -1,3 +1,3 @@
-[submodule "4dmap/4dmap_representation"]
-	path = 4dmap/4dmap_representation
+[submodule "map4d/representation"]
+	path = map4d/representation
 	url = git@github.com:Zehao-Du/DigitalGene-4d.git

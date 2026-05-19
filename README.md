@@ -4,9 +4,9 @@
 
 TODO: validate 4d map representation and losses in **ManiSkill** (on task **StackCube-v1** first).
 
-- [ ] 4d map representation, including losses (```4dmap/4dmap_representation/4dmaps```)
-- [ ] 4d map construction (```4dmap/4dmap_construction```)
-- [ ] 4d map encoder (```4dmap/4dmap_encoder```)
+- [ ] 4d map representation, including losses (```map4d/representation/maps4d```)
+- [ ] 4d map construction (```map4d/construction```)
+- [ ] 4d map encoder (```map4d/encoder```)
 - [ ] insert into baselines, like dp and act
 
 ## benckmark
@@ -49,10 +49,10 @@ Train dp
 seed=1
 demos=100
 python train_rgbd.py --env-id StackCube-v1 \
-  --demo-path ~/.maniskill/demos/PickCube-v1/motionplanning/trajectory.rgb.pd_ee_delta_pos.physx_cpu.h5 \
-  --control-mode "pd_ee_delta_pos" --sim-backend "physx_cpu" --num-demos ${demos} --max_episode_steps 100 \
-  --total_iters 30000 --obs-mode "rgb" \
-  --exp-name diffusion_policy-PickCube-v1-rgb-${demos}_motionplanning_demos-${seed} \
+  --demo-path /inspire/hdd/project/robot-dna/baojiachun-CZXS25130063/zehao/4dmap/dataset/ManiSkill/StackCube-v1/motionplanning/StackCube.rgb.pd_ee_delta_pose.physx_cpu.h5 \
+  --control-mode "pd_ee_delta_pos" --sim-backend "physx_cpu" --num-demos ${demos} --max_episode_steps 1000 \
+  --total_iters 400000 --obs-mode "rgb" \
+  --exp-name diffusion_policy-StackCube-v1-rgb-${demos}_motionplanning_demos-${seed} \
   --track
 ```
 
