@@ -1,3 +1,13 @@
 # dataset
 data/
 dataset/
+outputs/
+__pycache__/
+*.pyc
+
+# others
+run_dp_then_smaller_than_4_matrix.sh
+smaller_than_4_matrix.py
+
+# model weights
+weights/

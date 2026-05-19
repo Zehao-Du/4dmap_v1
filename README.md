@@ -4,10 +4,12 @@
 
 TODO: validate 4d map representation and losses in **ManiSkill** (on task **StackCube-v1** first).
 
-- [ ] 4d map representation, including losses (```map4d/representation/maps4d```)
-- [ ] 4d map construction (```map4d/construction```)
+- [x] 4d map representation, including losses (```map4d/representation/maps4d```)
+- [x] 4d map construction (```map4d/construction```)
 - [ ] 4d map encoder (```map4d/encoder```)
 - [ ] insert into baselines, like dp and act
+
+StackCube 的 4D map representation 已放在 ```map4d/representation/maps4d/maniskill_stackcube.py```，基于 ```Map_4d``` 保存 scene-level Objects，并用 red cube / green cube / desk 的 Cuboid 节点描述结构参数。Construction 入口在 ```map4d/construction/map_constructor.py```，当前流程是 RGB-D -> Grounded-SAM2/manual masks -> structural parameter estimator -> FoundationPose poses -> instantiated Map4d，后续 encoder 开发可直接通过 ```map4d/map4d_encoder.py``` 的 ```Map4d_Encoder.construction(...)``` 调用。
 
 ## benckmark
 

@@ -1,3 +1,12 @@
 [submodule "map4d/representation"]
 	path = map4d/representation
 	url = git@github.com:Zehao-Du/DigitalGene-4d.git
+[submodule "map4d/construction/SAM2/sam2"]
+	path = map4d/construction/SAM2/sam2
+	url = https://github.com/facebookresearch/sam2.git
+[submodule "map4d/construction/foundationpose/FoundationPose"]
+	path = map4d/construction/foundationpose/FoundationPose
+	url = https://github.com/NVlabs/FoundationPose.git
+[submodule "map4d/construction/GroundedSam/Grounded-SAM-2"]
+	path = map4d/construction/GroundedSam/Grounded-SAM-2
+	url = https://github.com/IDEA-Research/Grounded-SAM-2.git
