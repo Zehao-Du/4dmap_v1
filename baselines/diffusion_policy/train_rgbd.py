@@ -34,6 +34,7 @@ from diffusion_policy.plain_conv import PlainConv
 from diffusion_policy.utils import (IterationBasedBatchSampler,
                                     build_state_obs_extractor, convert_obs,
                                     worker_init_fn)
+from map4d.encoder import GeometricEncoder, PhysicsLosses
 
 
 @dataclass
@@ -83,6 +84,28 @@ class Args:
     n_groups: int = (
         8  # jigu says it is better to let each group have at least 8 channels; it seems 4 and 8 are simila
     )
+
+    # Map4D encoder/loss arguments
+    use_map4d: bool = False
+    """whether to fuse map4d features and physics losses"""
+    map4d_num_objects: int = 3
+    """number of objects in the 4d map representation"""
+    map4d_feature_dim: int = 128
+    """output feature dimension from the map4d encoder"""
+    map4d_node_dim: int = 128
+    map4d_relation_dim: int = 64
+    map4d_temporal_dim: int = 128
+    map4d_pose_weight: float = 1.0
+    map4d_penetration_weight: float = 0.1
+    map4d_kinematic_weight: float = 0.1
+    map4d_pointcloud_weight: float = 0.1
+    map4d_vel_limit: float = 0.5
+    map4d_acc_limit: float = 1.0
+    map4d_rot_vel_limit: float = 1.0
+    map4d_rot_acc_limit: float = 2.0
+    map4d_penetration_margin: float = 0.0
+    map4d_pointcloud_margin: float = 0.002
+    map4d_pointcloud_samples: int = 64
 
     # Environment/experiment specific arguments
     obs_mode: str = "rgb+depth"
@@ -169,10 +192,17 @@ class SmallDemoDataset_DiffusionPolicy(Dataset):  # Load everything into memory
         # Pre-process the observations, make them align with the obs returned by the obs_wrapper
         obs_traj_dict_list = []
         for obs_traj_dict in trajectories["observations"]:
+            map4d_raw = None
+            if isinstance(obs_traj_dict, dict):
+                map4d_raw = obs_traj_dict.get("map4d")
+                if map4d_raw is None:
+                    map4d_raw = obs_traj_dict.get("rep")
             _obs_traj_dict = reorder_keys(
                 obs_traj_dict, obs_space
             )  # key order in demo is different from key order in env obs
             _obs_traj_dict = obs_process_fn(_obs_traj_dict)
+            if map4d_raw is not None:
+                _obs_traj_dict["map4d"] = map4d_raw
             if self.include_depth:
                 _obs_traj_dict["depth"] = torch.Tensor(
                     _obs_traj_dict["depth"].astype(np.float32)
@@ -184,6 +214,10 @@ class SmallDemoDataset_DiffusionPolicy(Dataset):  # Load everything into memory
             _obs_traj_dict["state"] = torch.from_numpy(_obs_traj_dict["state"]).to(
                 device
             )
+            if "map4d" in _obs_traj_dict:
+                _obs_traj_dict["map4d"] = self._to_tensor_map4d(
+                    _obs_traj_dict["map4d"], device
+                )
             obs_traj_dict_list.append(_obs_traj_dict)
         trajectories["observations"] = obs_traj_dict_list
         self.obs_keys = list(_obs_traj_dict.keys())
@@ -252,6 +286,19 @@ class SmallDemoDataset_DiffusionPolicy(Dataset):  # Load everything into memory
 
         self.trajectories = trajectories
 
+    def _to_tensor_map4d(self, value, device):
+        if hasattr(value, "Objects") or hasattr(value, "objects"):
+            return value
+        if isinstance(value, (list, tuple)) and len(value) > 0:
+            if hasattr(value[0], "Objects") or hasattr(value[0], "objects"):
+                return value
+        if isinstance(value, dict):
+            return {
+                k: torch.as_tensor(v, device=device)
+                for k, v in value.items()
+            }
+        return torch.as_tensor(value, device=device)
+
     def __getitem__(self, index):
         traj_idx, start, end = self.slices[index]
         L, act_dim = self.trajectories["actions"][traj_idx].shape
@@ -259,12 +306,7 @@ class SmallDemoDataset_DiffusionPolicy(Dataset):  # Load everything into memory
         obs_traj = self.trajectories["observations"][traj_idx]
         obs_seq = {}
         for k, v in obs_traj.items():
-            obs_seq[k] = v[
-                max(0, start) : start + self.obs_horizon
-            ]  # start+self.obs_horizon is at least 1
-            if start < 0:  # pad before the trajectory
-                pad_obs_seq = torch.stack([obs_seq[k][0]] * abs(start), dim=0)
-                obs_seq[k] = torch.cat((pad_obs_seq, obs_seq[k]), dim=0)
+            obs_seq[k] = self._slice_time(v, start, self.obs_horizon)
             # don't need to pad obs after the trajectory, see the above char drawing
 
         act_seq = self.trajectories["actions"][traj_idx][max(0, start) : end]
@@ -284,6 +326,18 @@ class SmallDemoDataset_DiffusionPolicy(Dataset):  # Load everything into memory
             "actions": act_seq,
         }
 
+    def _slice_time(self, value, start, horizon):
+        if isinstance(value, dict):
+            return {
+                k: self._slice_time(v, start, horizon)
+                for k, v in value.items()
+            }
+        seq = value[max(0, start) : start + horizon]
+        if start < 0:
+            pad = seq[0].unsqueeze(0).repeat(abs(start), *([1] * (seq.ndim - 1)))
+            seq = torch.cat((pad, seq), dim=0)
+        return seq
+
     def __len__(self):
         return len(self.slices)
 
@@ -294,6 +348,7 @@ class Agent(nn.Module):
         self.obs_horizon = args.obs_horizon
         self.act_horizon = args.act_horizon
         self.pred_horizon = args.pred_horizon
+        self.use_map4d = args.use_map4d
         assert (
             len(env.single_observation_space["state"].shape) == 2
         )  # (obs_horizon, obs_dim)
@@ -314,12 +369,39 @@ class Agent(nn.Module):
             total_visual_channels += env.single_observation_space["depth"].shape[-1]
 
         visual_feature_dim = 256
+        map4d_feature_dim = args.map4d_feature_dim if self.use_map4d else 0
         self.visual_encoder = PlainConv(
             in_channels=total_visual_channels, out_dim=visual_feature_dim, pool_feature_map=True
         )
+        if self.use_map4d:
+            self.map4d_encoder = GeometricEncoder(
+                num_objects=args.map4d_num_objects,
+                node_dim=args.map4d_node_dim,
+                relation_dim=args.map4d_relation_dim,
+                temporal_dim=args.map4d_temporal_dim,
+                feature_dim=args.map4d_feature_dim,
+            )
+            self.map4d_losses = PhysicsLosses(
+                num_objects=args.map4d_num_objects,
+                pose_weight=args.map4d_pose_weight,
+                penetration_weight=args.map4d_penetration_weight,
+                kinematic_weight=args.map4d_kinematic_weight,
+                pointcloud_weight=args.map4d_pointcloud_weight,
+                vel_limit=args.map4d_vel_limit,
+                acc_limit=args.map4d_acc_limit,
+                rot_vel_limit=args.map4d_rot_vel_limit,
+                rot_acc_limit=args.map4d_rot_acc_limit,
+                penetration_margin=args.map4d_penetration_margin,
+                pointcloud_margin=args.map4d_pointcloud_margin,
+                pointcloud_samples=args.map4d_pointcloud_samples,
+            )
+        else:
+            self.map4d_encoder = None
+            self.map4d_losses = None
         self.noise_pred_net = ConditionalUnet1D(
             input_dim=self.act_dim,  # act_horizon is not used (U-Net doesn't care)
-            global_cond_dim=self.obs_horizon * (visual_feature_dim + obs_state_dim),
+            global_cond_dim=self.obs_horizon
+            * (visual_feature_dim + obs_state_dim + map4d_feature_dim),
             diffusion_step_embed_dim=args.diffusion_step_embed_dim,
             down_dims=args.unet_dims,
             n_groups=args.n_groups,
@@ -349,16 +431,30 @@ class Agent(nn.Module):
         visual_feature = visual_feature.reshape(
             batch_size, self.obs_horizon, visual_feature.shape[1]
         )  # (B, obs_horizon, D)
-        feature = torch.cat(
-            (visual_feature, obs_seq["state"]), dim=-1
-        )  # (B, obs_horizon, D+obs_state_dim)
-        return feature.flatten(start_dim=1)  # (B, obs_horizon * (D+obs_state_dim))
+        map_feature = None
+        map_aux = None
+        if self.use_map4d and ("map4d" in obs_seq):
+            map_feature, map_aux = self.map4d_encoder(obs_seq["map4d"])
+        elif self.use_map4d:
+            map_feature = torch.zeros(
+                (batch_size, self.obs_horizon, self.map4d_encoder.feature_dim),
+                device=visual_feature.device,
+            )
+        if map_feature is not None:
+            feature = torch.cat(
+                (visual_feature, obs_seq["state"], map_feature), dim=-1
+            )
+        else:
+            feature = torch.cat(
+                (visual_feature, obs_seq["state"]), dim=-1
+            )
+        return feature.flatten(start_dim=1), map_aux
 
     def compute_loss(self, obs_seq, action_seq):
         B = obs_seq["state"].shape[0]
 
         # observation as FiLM conditioning
-        obs_cond = self.encode_obs(
+        obs_cond, map_aux = self.encode_obs(
             obs_seq, eval_mode=False
         )  # (B, obs_horizon * obs_dim)
 
@@ -379,7 +475,13 @@ class Agent(nn.Module):
             noisy_action_seq, timesteps, global_cond=obs_cond
         )
 
-        return F.mse_loss(noise_pred, noise)
+        dp_loss = F.mse_loss(noise_pred, noise)
+        if self.use_map4d and self.map4d_losses is not None and map_aux is not None:
+            map_losses = self.map4d_losses(map_aux)
+            self.last_map_losses = map_losses
+            return dp_loss + map_losses["total"]
+        self.last_map_losses = None
+        return dp_loss
 
     def get_action(self, obs_seq):
         # init scheduler
@@ -396,7 +498,7 @@ class Agent(nn.Module):
             if self.include_depth:
                 obs_seq["depth"] = obs_seq["depth"].permute(0, 1, 4, 2, 3)
 
-            obs_cond = self.encode_obs(
+            obs_cond, _ = self.encode_obs(
                 obs_seq, eval_mode=True
             )  # (B, obs_horizon * obs_dim)
 
@@ -610,6 +712,13 @@ if __name__ == "__main__":
                 "charts/learning_rate", optimizer.param_groups[0]["lr"], iteration
             )
             writer.add_scalar("losses/total_loss", total_loss.item(), iteration)
+            if getattr(agent, "last_map_losses", None) is not None:
+                map_losses = agent.last_map_losses
+                writer.add_scalar("losses/map4d_total", map_losses["total"].item(), iteration)
+                writer.add_scalar("losses/map4d_pose", map_losses["pose"].item(), iteration)
+                writer.add_scalar("losses/map4d_kinematic", map_losses["kinematic"].item(), iteration)
+                writer.add_scalar("losses/map4d_penetration", map_losses["penetration"].item(), iteration)
+                writer.add_scalar("losses/map4d_point_cloud", map_losses["point_cloud"].item(), iteration)
             for k, v in timings.items():
                 writer.add_scalar(f"time/{k}", v, iteration)
 

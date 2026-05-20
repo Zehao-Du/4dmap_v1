@@ -140,6 +140,11 @@ def load_demo_dataset(
 
 
 def convert_obs(obs, concat_fn, transpose_fn, state_obs_extractor, depth = True):
+    map4d = None
+    if isinstance(obs, dict):
+        map4d = obs.pop("map4d", None)
+        if map4d is None:
+            map4d = obs.pop("rep", None)
     img_dict = obs["sensor_data"]
     ls = ["rgb"]
     if depth:
@@ -177,6 +182,9 @@ def convert_obs(obs, concat_fn, transpose_fn, state_obs_extractor, depth = True)
 
     if "depth" in new_img_dict:
         out_dict["depth"] = new_img_dict["depth"]
+
+    if map4d is not None:
+        out_dict["map4d"] = map4d
 
 
     return out_dict
