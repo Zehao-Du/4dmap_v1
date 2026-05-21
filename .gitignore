@@ -1,3 +1,27 @@
 # dataset
 data/
 dataset/
+outputs/
+runs/
+
+# experiment logs
+wandb/
+videos/
+*.log
+nohup.out
+
+# python caches
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# others
+scripts/
+run_dp_then_smaller_than_4_matrix.sh
+smaller_than_4_matrix.py
+
+# model weights
+weights/
+checkpoints/

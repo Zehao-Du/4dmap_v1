@@ -2,6 +2,7 @@ ALGO_NAME = "BC_Diffusion_rgbd_UNet"
 
 import os
 import random
+import sys
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -19,13 +20,38 @@ from tqdm import tqdm
 import tyro
 from diffusers.optimization import get_scheduler
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
-from diffusers.training_utils import EMAModel
+try:
+    from diffusers.training_utils import EMAModel
+except Exception:
+    class EMAModel:
+        """Small fallback used when diffusers' optional training imports are broken."""
+
+        def __init__(self, parameters, power=0.75):
+            self.decay = float(power)
+            self.shadow_params = [p.detach().clone() for p in parameters]
+
+        def step(self, parameters):
+            with torch.no_grad():
+                for shadow, param in zip(self.shadow_params, parameters):
+                    shadow.mul_(self.decay).add_(param.detach(), alpha=1.0 - self.decay)
+
+        def copy_to(self, parameters):
+            with torch.no_grad():
+                for shadow, param in zip(self.shadow_params, parameters):
+                    param.copy_(shadow)
 from gymnasium import spaces
 from mani_skill.utils.wrappers.flatten import FlattenRGBDObservationWrapper
 from torch.utils.data.dataloader import DataLoader
 from torch.utils.data.dataset import Dataset
 from torch.utils.data.sampler import BatchSampler, RandomSampler
 from torch.utils.tensorboard import SummaryWriter
+
+_BASELINE_DIR = os.path.dirname(__file__)
+_REPO_ROOT = os.path.abspath(os.path.join(_BASELINE_DIR, "..", ".."))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+if _BASELINE_DIR not in sys.path:
+    sys.path.insert(0, _BASELINE_DIR)
 
 from diffusion_policy.conditional_unet1d import ConditionalUnet1D
 from diffusion_policy.evaluate import evaluate
@@ -34,6 +60,21 @@ from diffusion_policy.plain_conv import PlainConv
 from diffusion_policy.utils import (IterationBasedBatchSampler,
                                     build_state_obs_extractor, convert_obs,
                                     worker_init_fn)
+from map4d.encoder import PhysicsLosses
+from map4d.map4d_encoder import Map4d_Encoder
+
+
+STACKCUBE_GT_SIZES_MANISKILL_XYZ = (
+    0.04,
+    0.04,
+    0.04,
+    0.04,
+    0.04,
+    0.04,
+    1.2090764,
+    2.4178784,
+    0.91964292762787,
+)
 
 
 @dataclass
@@ -83,6 +124,35 @@ class Args:
     n_groups: int = (
         8  # jigu says it is better to let each group have at least 8 channels; it seems 4 and 8 are simila
     )
+
+    # Map4D encoder/loss arguments
+    use_map4d: bool = False
+    """whether to fuse map4d features and physics losses"""
+    map4d_num_objects: int = 3
+    """number of objects in the 4d map representation"""
+    map4d_feature_dim: int = 128
+    """output feature dimension from the map4d encoder"""
+    map4d_node_dim: int = 128
+    map4d_relation_dim: int = 64
+    map4d_temporal_dim: int = 128
+    map4d_future_horizon: int = 1
+    map4d_source: str = "maniskill_gt"
+    """source of map4d observations; v1 supports maniskill_gt for StackCube-v1"""
+    map4d_task_name: str = "StackCube-v1"
+    """task name used by the map4d GT constructor"""
+    map4d_strict: bool = True
+    """raise when use_map4d is enabled but map4d observations are unavailable"""
+    map4d_pose_weight: float = 1.0
+    map4d_penetration_weight: float = 0.1
+    map4d_kinematic_weight: float = 0.1
+    map4d_pointcloud_weight: float = 0.1
+    map4d_vel_limit: float = 0.5
+    map4d_acc_limit: float = 1.0
+    map4d_rot_vel_limit: float = 1.0
+    map4d_rot_acc_limit: float = 2.0
+    map4d_penetration_margin: float = 0.0
+    map4d_pointcloud_margin: float = 0.002
+    map4d_pointcloud_samples: int = 64
 
     # Environment/experiment specific arguments
     obs_mode: str = "rgb+depth"
@@ -145,6 +215,74 @@ def convert_actions_for_control_mode(actions, dataset_control_mode, target_contr
     )
 
 
+def _quat_wxyz_to_rotation_6d_np(quat_wxyz):
+    quat = np.asarray(quat_wxyz, dtype=np.float32)
+    if quat.ndim != 2 or quat.shape[1] != 4:
+        raise ValueError(f"Expected quaternion shape [T, 4], got {quat.shape}")
+    quat = quat / np.linalg.norm(quat, axis=1, keepdims=True).clip(min=1e-8)
+    w, x, y, z = quat[:, 0], quat[:, 1], quat[:, 2], quat[:, 3]
+    matrix = np.empty((quat.shape[0], 3, 3), dtype=np.float32)
+    matrix[:, 0, 0] = 1.0 - 2.0 * (y * y + z * z)
+    matrix[:, 0, 1] = 2.0 * (x * y - z * w)
+    matrix[:, 0, 2] = 2.0 * (x * z + y * w)
+    matrix[:, 1, 0] = 2.0 * (x * y + z * w)
+    matrix[:, 1, 1] = 1.0 - 2.0 * (x * x + z * z)
+    matrix[:, 1, 2] = 2.0 * (y * z - x * w)
+    matrix[:, 2, 0] = 2.0 * (x * z - y * w)
+    matrix[:, 2, 1] = 2.0 * (y * z + x * w)
+    matrix[:, 2, 2] = 1.0 - 2.0 * (x * x + y * y)
+    return np.concatenate([matrix[:, :, 0], matrix[:, :, 1]], axis=1).astype(np.float32)
+
+
+def _actor_states_to_map4d_tensor(
+    actor_states,
+    *,
+    sizes=STACKCUBE_GT_SIZES_MANISKILL_XYZ,
+):
+    states = [np.asarray(state, dtype=np.float32) for state in actor_states]
+    frame_count = states[0].shape[0]
+    if any(state.shape[0] != frame_count for state in states):
+        raise ValueError("All actor state arrays must have the same frame count.")
+    sizes_np = np.asarray(sizes, dtype=np.float32).reshape(3, 3)
+    sizes_seq = np.broadcast_to(sizes_np, (frame_count, 3, 3))
+    positions = np.stack([state[:, 0:3] for state in states], axis=1)
+    rotations = np.stack(
+        [_quat_wxyz_to_rotation_6d_np(state[:, 3:7]) for state in states],
+        axis=1,
+    )
+    return np.concatenate([sizes_seq, positions, rotations], axis=-1).astype(np.float32)
+
+
+def _load_maniskill_gt_map4d_tensors(
+    data_path,
+    *,
+    num_traj=None,
+    task_name="StackCube-v1",
+    actor_names=("cubeA", "cubeB", "table-workspace"),
+    device=None,
+):
+    if task_name != "StackCube-v1":
+        raise ValueError("map4d_source=maniskill_gt currently supports StackCube-v1 only.")
+    import h5py
+
+    with h5py.File(data_path, "r") as f:
+        traj_keys = [key for key in f.keys() if key.startswith("traj_")]
+        traj_keys = sorted(traj_keys, key=lambda key: int(key.split("_")[-1]))
+        if num_traj is not None:
+            traj_keys = traj_keys[:num_traj]
+
+        map4d_tensors = []
+        for traj_key in traj_keys:
+            actors = f[traj_key]["env_states"]["actors"]
+            missing = [name for name in actor_names if name not in actors]
+            if missing:
+                raise KeyError(f"{traj_key} missing ManiSkill GT actors: {missing}")
+            actor_states = [actors[name][()] for name in actor_names]
+            map4d_np = _actor_states_to_map4d_tensor(actor_states)
+            map4d_tensors.append(torch.as_tensor(map4d_np, device=device))
+    return map4d_tensors
+
+
 class SmallDemoDataset_DiffusionPolicy(Dataset):  # Load everything into memory
     def __init__(
         self,
@@ -157,9 +295,18 @@ class SmallDemoDataset_DiffusionPolicy(Dataset):  # Load everything into memory
         num_traj,
         dataset_control_mode,
         target_control_mode,
+        use_map4d=False,
+        map4d_source="maniskill_gt",
+        map4d_task_name="StackCube-v1",
+        map4d_future_horizon=1,
+        map4d_strict=True,
     ):
         self.include_rgb = include_rgb
         self.include_depth = include_depth
+        self.use_map4d = use_map4d
+        self.map4d_source = map4d_source
+        self.map4d_future_horizon = int(map4d_future_horizon)
+        self.map4d_strict = map4d_strict
         from diffusion_policy.utils import load_demo_dataset
         trajectories = load_demo_dataset(data_path, num_traj=num_traj, concat=False)
         # trajectories['observations'] is a list of dict, each dict is a traj, with keys in obs_space, values with length L+1
@@ -169,10 +316,17 @@ class SmallDemoDataset_DiffusionPolicy(Dataset):  # Load everything into memory
         # Pre-process the observations, make them align with the obs returned by the obs_wrapper
         obs_traj_dict_list = []
         for obs_traj_dict in trajectories["observations"]:
+            map4d_raw = None
+            if isinstance(obs_traj_dict, dict):
+                map4d_raw = obs_traj_dict.get("map4d")
+                if map4d_raw is None:
+                    map4d_raw = obs_traj_dict.get("rep")
             _obs_traj_dict = reorder_keys(
                 obs_traj_dict, obs_space
             )  # key order in demo is different from key order in env obs
             _obs_traj_dict = obs_process_fn(_obs_traj_dict)
+            if map4d_raw is not None:
+                _obs_traj_dict["map4d"] = map4d_raw
             if self.include_depth:
                 _obs_traj_dict["depth"] = torch.Tensor(
                     _obs_traj_dict["depth"].astype(np.float32)
@@ -184,9 +338,33 @@ class SmallDemoDataset_DiffusionPolicy(Dataset):  # Load everything into memory
             _obs_traj_dict["state"] = torch.from_numpy(_obs_traj_dict["state"]).to(
                 device
             )
+            if "map4d" in _obs_traj_dict:
+                _obs_traj_dict["map4d"] = self._to_tensor_map4d(
+                    _obs_traj_dict["map4d"], device
+                )
             obs_traj_dict_list.append(_obs_traj_dict)
         trajectories["observations"] = obs_traj_dict_list
         self.obs_keys = list(_obs_traj_dict.keys())
+        if self.use_map4d and "map4d" not in self.obs_keys:
+            if self.map4d_source != "maniskill_gt":
+                raise ValueError(f"Unsupported map4d_source={self.map4d_source!r}")
+            map4d_trajs = _load_maniskill_gt_map4d_tensors(
+                data_path,
+                num_traj=num_traj,
+                task_name=map4d_task_name,
+                device=device,
+            )
+            if len(map4d_trajs) != len(trajectories["observations"]):
+                raise ValueError(
+                    f"Loaded {len(map4d_trajs)} map4d trajectories for "
+                    f"{len(trajectories['observations'])} observation trajectories."
+                )
+            for traj_idx, map4d_tensor in enumerate(map4d_trajs):
+                trajectories["observations"][traj_idx]["map4d"] = map4d_tensor
+            self.obs_keys.append("map4d")
+            print(f"Loaded ManiSkill GT map4d tensors for {len(map4d_trajs)} trajectories.")
+        elif self.use_map4d:
+            print("Using map4d/rep stored in observations.")
         # Pre-process the actions
         for i in range(len(trajectories["actions"])):
             trajectories["actions"][i] = convert_actions_for_control_mode(
@@ -230,6 +408,12 @@ class SmallDemoDataset_DiffusionPolicy(Dataset):  # Load everything into memory
         for traj_idx in range(num_traj):
             L = trajectories["actions"][traj_idx].shape[0]
             assert trajectories["observations"][traj_idx]["state"].shape[0] == L + 1
+            if self.use_map4d:
+                map4d_len = trajectories["observations"][traj_idx]["map4d"].shape[0]
+                if map4d_len != L + 1:
+                    raise ValueError(
+                        f"Trajectory {traj_idx} map4d length {map4d_len} does not match actions length {L} + 1."
+                    )
             total_transitions += L
 
             # |o|o|                             observations: 2
@@ -252,6 +436,19 @@ class SmallDemoDataset_DiffusionPolicy(Dataset):  # Load everything into memory
 
         self.trajectories = trajectories
 
+    def _to_tensor_map4d(self, value, device):
+        if hasattr(value, "Objects") or hasattr(value, "objects"):
+            return value
+        if isinstance(value, (list, tuple)) and len(value) > 0:
+            if hasattr(value[0], "Objects") or hasattr(value[0], "objects"):
+                return value
+        if isinstance(value, dict):
+            return {
+                k: torch.as_tensor(v, device=device)
+                for k, v in value.items()
+            }
+        return torch.as_tensor(value, device=device)
+
     def __getitem__(self, index):
         traj_idx, start, end = self.slices[index]
         L, act_dim = self.trajectories["actions"][traj_idx].shape
@@ -259,13 +456,19 @@ class SmallDemoDataset_DiffusionPolicy(Dataset):  # Load everything into memory
         obs_traj = self.trajectories["observations"][traj_idx]
         obs_seq = {}
         for k, v in obs_traj.items():
-            obs_seq[k] = v[
-                max(0, start) : start + self.obs_horizon
-            ]  # start+self.obs_horizon is at least 1
-            if start < 0:  # pad before the trajectory
-                pad_obs_seq = torch.stack([obs_seq[k][0]] * abs(start), dim=0)
-                obs_seq[k] = torch.cat((pad_obs_seq, obs_seq[k]), dim=0)
+            obs_seq[k] = self._slice_time(v, start, self.obs_horizon)
             # don't need to pad obs after the trajectory, see the above char drawing
+        if self.use_map4d:
+            if "map4d" not in obs_traj:
+                if self.map4d_strict:
+                    raise KeyError("use_map4d=True but trajectory does not include map4d.")
+            else:
+                current_idx = max(0, start + self.obs_horizon - 1)
+                obs_seq["future_map4d"] = self._slice_future_time(
+                    obs_traj["map4d"],
+                    current_idx + 1,
+                    self.map4d_future_horizon,
+                )
 
         act_seq = self.trajectories["actions"][traj_idx][max(0, start) : end]
         if start < 0:  # pad before the trajectory
@@ -284,6 +487,30 @@ class SmallDemoDataset_DiffusionPolicy(Dataset):  # Load everything into memory
             "actions": act_seq,
         }
 
+    def _slice_time(self, value, start, horizon):
+        if isinstance(value, dict):
+            return {
+                k: self._slice_time(v, start, horizon)
+                for k, v in value.items()
+            }
+        seq = value[max(0, start) : start + horizon]
+        if start < 0:
+            pad = seq[0].unsqueeze(0).repeat(abs(start), *([1] * (seq.ndim - 1)))
+            seq = torch.cat((pad, seq), dim=0)
+        return seq
+
+    def _slice_future_time(self, value, start, horizon):
+        if isinstance(value, dict):
+            return {
+                k: self._slice_future_time(v, start, horizon)
+                for k, v in value.items()
+            }
+        if horizon <= 0:
+            return value.new_zeros((0, *value.shape[1:]))
+        indices = torch.arange(start, start + horizon, device=value.device)
+        indices = indices.clamp(0, value.shape[0] - 1)
+        return value.index_select(0, indices)
+
     def __len__(self):
         return len(self.slices)
 
@@ -294,6 +521,8 @@ class Agent(nn.Module):
         self.obs_horizon = args.obs_horizon
         self.act_horizon = args.act_horizon
         self.pred_horizon = args.pred_horizon
+        self.use_map4d = args.use_map4d
+        self.map4d_strict = args.map4d_strict
         assert (
             len(env.single_observation_space["state"].shape) == 2
         )  # (obs_horizon, obs_dim)
@@ -314,12 +543,41 @@ class Agent(nn.Module):
             total_visual_channels += env.single_observation_space["depth"].shape[-1]
 
         visual_feature_dim = 256
+        map4d_feature_dim = args.map4d_feature_dim if self.use_map4d else 0
         self.visual_encoder = PlainConv(
             in_channels=total_visual_channels, out_dim=visual_feature_dim, pool_feature_map=True
         )
+        if self.use_map4d:
+            self.map4d_encoder = Map4d_Encoder(
+                num_objects=args.map4d_num_objects,
+                pre_horizon=args.obs_horizon,
+                future_horizon=args.map4d_future_horizon,
+                node_dim=args.map4d_node_dim,
+                relation_dim=args.map4d_relation_dim,
+                temporal_dim=args.map4d_temporal_dim,
+                feature_dim=args.map4d_feature_dim,
+            )
+            self.map4d_losses = PhysicsLosses(
+                num_objects=args.map4d_num_objects,
+                pose_weight=args.map4d_pose_weight,
+                penetration_weight=args.map4d_penetration_weight,
+                kinematic_weight=args.map4d_kinematic_weight,
+                pointcloud_weight=args.map4d_pointcloud_weight,
+                vel_limit=args.map4d_vel_limit,
+                acc_limit=args.map4d_acc_limit,
+                rot_vel_limit=args.map4d_rot_vel_limit,
+                rot_acc_limit=args.map4d_rot_acc_limit,
+                penetration_margin=args.map4d_penetration_margin,
+                pointcloud_margin=args.map4d_pointcloud_margin,
+                pointcloud_samples=args.map4d_pointcloud_samples,
+            )
+        else:
+            self.map4d_encoder = None
+            self.map4d_losses = None
         self.noise_pred_net = ConditionalUnet1D(
             input_dim=self.act_dim,  # act_horizon is not used (U-Net doesn't care)
-            global_cond_dim=self.obs_horizon * (visual_feature_dim + obs_state_dim),
+            global_cond_dim=self.obs_horizon
+            * (visual_feature_dim + obs_state_dim + map4d_feature_dim),
             diffusion_step_embed_dim=args.diffusion_step_embed_dim,
             down_dims=args.unet_dims,
             n_groups=args.n_groups,
@@ -349,16 +607,38 @@ class Agent(nn.Module):
         visual_feature = visual_feature.reshape(
             batch_size, self.obs_horizon, visual_feature.shape[1]
         )  # (B, obs_horizon, D)
-        feature = torch.cat(
-            (visual_feature, obs_seq["state"]), dim=-1
-        )  # (B, obs_horizon, D+obs_state_dim)
-        return feature.flatten(start_dim=1)  # (B, obs_horizon * (D+obs_state_dim))
+        map_feature = None
+        map_aux = None
+        if self.use_map4d and ("map4d" in obs_seq):
+            if eval_mode:
+                map_feature = self.map4d_encoder(map4d_seq=obs_seq["map4d"])
+            else:
+                map_feature, map_aux = self.map4d_encoder.forward_with_aux(
+                    map4d_seq=obs_seq["map4d"],
+                    future_map4d_seq=obs_seq.get("future_map4d"),
+                )
+        elif self.use_map4d:
+            if self.map4d_strict:
+                raise KeyError("use_map4d=True but obs_seq does not include map4d.")
+            map_feature = torch.zeros(
+                (batch_size, self.obs_horizon, self.map4d_encoder.feature_dim),
+                device=visual_feature.device,
+            )
+        if map_feature is not None:
+            feature = torch.cat(
+                (visual_feature, obs_seq["state"], map_feature), dim=-1
+            )
+        else:
+            feature = torch.cat(
+                (visual_feature, obs_seq["state"]), dim=-1
+            )
+        return feature.flatten(start_dim=1), map_aux
 
     def compute_loss(self, obs_seq, action_seq):
         B = obs_seq["state"].shape[0]
 
         # observation as FiLM conditioning
-        obs_cond = self.encode_obs(
+        obs_cond, map_aux = self.encode_obs(
             obs_seq, eval_mode=False
         )  # (B, obs_horizon * obs_dim)
 
@@ -379,7 +659,13 @@ class Agent(nn.Module):
             noisy_action_seq, timesteps, global_cond=obs_cond
         )
 
-        return F.mse_loss(noise_pred, noise)
+        dp_loss = F.mse_loss(noise_pred, noise)
+        if self.use_map4d and self.map4d_losses is not None and map_aux is not None:
+            map_losses = self.map4d_losses(map_aux)
+            self.last_map_losses = map_losses
+            return dp_loss + map_losses["total"]
+        self.last_map_losses = None
+        return dp_loss
 
     def get_action(self, obs_seq):
         # init scheduler
@@ -396,7 +682,7 @@ class Agent(nn.Module):
             if self.include_depth:
                 obs_seq["depth"] = obs_seq["depth"].permute(0, 1, 4, 2, 3)
 
-            obs_cond = self.encode_obs(
+            obs_cond, _ = self.encode_obs(
                 obs_seq, eval_mode=True
             )  # (B, obs_horizon * obs_dim)
 
@@ -494,6 +780,9 @@ if __name__ == "__main__":
         other_kwargs,
         video_dir=f"runs/{run_name}/videos" if args.capture_video else None,
         wrappers=[FlattenRGBDObservationWrapper],
+        map4d_source=args.map4d_source if args.use_map4d else None,
+        map4d_task_name=args.map4d_task_name,
+        map4d_strict=args.map4d_strict,
     )
 
     if args.track:
@@ -524,7 +813,7 @@ if __name__ == "__main__":
             np.transpose, axes=(0, 3, 1, 2)
         ),  # (B, H, W, C) -> (B, C, H, W)
         state_obs_extractor=build_state_obs_extractor(args.env_id),
-        depth = "rgbd" in args.demo_path
+        depth=("depth" in args.obs_mode or "depth" in args.demo_path or "rgbd" in args.demo_path),
     )
 
     # create temporary env to get original observation space as AsyncVectorEnv (CPU parallelization) doesn't permit that
@@ -545,6 +834,11 @@ if __name__ == "__main__":
         num_traj=args.num_demos,
         dataset_control_mode=control_mode,
         target_control_mode=args.control_mode,
+        use_map4d=args.use_map4d,
+        map4d_source=args.map4d_source,
+        map4d_task_name=args.map4d_task_name,
+        map4d_future_horizon=args.map4d_future_horizon,
+        map4d_strict=args.map4d_strict,
     )
     sampler = RandomSampler(dataset, replacement=False)
     batch_sampler = BatchSampler(sampler, batch_size=args.batch_size, drop_last=True)
@@ -582,7 +876,7 @@ if __name__ == "__main__":
 
     # define evaluation and logging functions
     def evaluate_and_save_best(iteration):
-        if iteration % args.eval_freq == 0:
+        if iteration > 0 and iteration % args.eval_freq == 0:
             last_tick = time.time()
             ema.copy_to(ema_agent.parameters())
             eval_metrics = evaluate(
@@ -610,6 +904,13 @@ if __name__ == "__main__":
                 "charts/learning_rate", optimizer.param_groups[0]["lr"], iteration
             )
             writer.add_scalar("losses/total_loss", total_loss.item(), iteration)
+            if getattr(agent, "last_map_losses", None) is not None:
+                map_losses = agent.last_map_losses
+                writer.add_scalar("losses/map4d_total", map_losses["total"].item(), iteration)
+                writer.add_scalar("losses/map4d_pose", map_losses["pose"].item(), iteration)
+                writer.add_scalar("losses/map4d_kinematic", map_losses["kinematic"].item(), iteration)
+                writer.add_scalar("losses/map4d_penetration", map_losses["penetration"].item(), iteration)
+                writer.add_scalar("losses/map4d_point_cloud", map_losses["point_cloud"].item(), iteration)
             for k, v in timings.items():
                 writer.add_scalar(f"time/{k}", v, iteration)
 
