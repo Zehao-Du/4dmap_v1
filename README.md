@@ -64,6 +64,43 @@ python train_rgbd.py --env-id StackCube-v1 \
   --track
 ```
 
+Train dp with 4D map
+
+The current StackCube 4D map training path uses ManiSkill GT to build a 4D map tensor for each observation sequence. The training config is kept in ```baselines/diffusion_policy/configs/stackcube_map4d_train.conf``` and loads 100 trajectories by default to match the baseline setting.
+
+```bash
+cd /inspire/hdd/project/robot-dna/baojiachun-CZXS25130063/zehao/4dmap/4dmap_policy
+conda activate 4dmap
+
+source baselines/diffusion_policy/configs/stackcube_map4d_train.conf
+mkdir -p "$(dirname "${LOG_FILE}")"
+python baselines/diffusion_policy/train_rgbd.py "${TRAIN_ARGS[@]}" 2>&1 | tee "${LOG_FILE}"
+```
+
+For a background run:
+
+```bash
+cd /inspire/hdd/project/robot-dna/baojiachun-CZXS25130063/zehao/4dmap/4dmap_policy
+conda activate 4dmap
+
+source baselines/diffusion_policy/configs/stackcube_map4d_train.conf
+mkdir -p "$(dirname "${LOG_FILE}")"
+nohup python baselines/diffusion_policy/train_rgbd.py "${TRAIN_ARGS[@]}" > "${LOG_FILE}" 2>&1 &
+tail -f "${LOG_FILE}"
+```
+
+The config uses ```--use-map4d```, ```--map4d-source maniskill_gt```, ```--obs-mode rgb+depth```, and ```--num-demos 100```. Wandb upload is disabled by default through ```--no-track```; set ```WANDB_MODE=offline``` if you later enable tracking.
+
+Smoke test:
+
+```bash
+cd /inspire/hdd/project/robot-dna/baojiachun-CZXS25130063/zehao/4dmap/4dmap_policy
+conda activate 4dmap
+python baselines/diffusion_policy/smoke_map4d_pipeline.py
+```
+
+The smoke test writes review artifacts under ```outputs/map4d_pipeline_smoke```, including tensors, arrays, RGB images, and 4D map visualizations.
+
 
 ## requirements
 
