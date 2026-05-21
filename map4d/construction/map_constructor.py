@@ -17,6 +17,19 @@ if str(_MAPS4D_DIR) not in sys.path:
     sys.path.insert(0, str(_MAPS4D_DIR))
 
 
+STACKCUBE_GT_SIZES_MANISKILL_XYZ = (
+    0.04,
+    0.04,
+    0.04,
+    0.04,
+    0.04,
+    0.04,
+    1.2090764,
+    2.4178784,
+    0.91964292762787,
+)
+
+
 @dataclass
 class ObjectConstructionResult:
     object_index: int
@@ -914,13 +927,76 @@ class Map4dSingleFrameConstructor(Map4dConstructor):
     """Explicit single-frame constructor name."""
 
 
+class ManiSkillGTMap4dConstructor:
+    """Build StackCube 4D maps directly from ManiSkill actor GT states."""
+
+    def __init__(
+        self,
+        *,
+        task_name: str = "StackCube-v1",
+        actor_names: tuple[str, str, str] = ("cubeA", "cubeB", "table-workspace"),
+        sizes: tuple[float, ...] = STACKCUBE_GT_SIZES_MANISKILL_XYZ,
+        device: str = "cpu",
+    ):
+        if task_name != "StackCube-v1":
+            raise ValueError("ManiSkillGTMap4dConstructor currently supports StackCube-v1 only.")
+        if len(actor_names) != 3:
+            raise ValueError("actor_names must be (red_cube_actor, green_cube_actor, desk_actor).")
+        if len(sizes) != 9:
+            raise ValueError("sizes must contain 9 values: 3 per object.")
+        self.task_name = task_name
+        self.actor_names = tuple(actor_names)
+        self.sizes = tuple(float(v) for v in sizes)
+        self.device = device
+
+    def construct_from_h5(self, h5_path, *, traj_key: str = "traj_0", frame_indices=None):
+        import h5py
+
+        with h5py.File(h5_path, "r") as f:
+            if traj_key not in f:
+                raise KeyError(f"Trajectory {traj_key!r} not found in {h5_path}")
+            return self.construct_from_group(f[traj_key], frame_indices=frame_indices)
+
+    def construct_from_group(self, traj_group, *, frame_indices=None):
+        actors = traj_group["env_states"]["actors"]
+        states = [np.asarray(actors[name], dtype=np.float32) for name in self.actor_names]
+        return self.construct_from_actor_states(*states, frame_indices=frame_indices)
+
+    def construct_from_actor_states(self, red_cube_state, green_cube_state, desk_state, *, frame_indices=None):
+        import torch
+
+        actor_states = [np.asarray(state, dtype=np.float32) for state in (red_cube_state, green_cube_state, desk_state)]
+        if frame_indices is not None:
+            actor_states = [state[frame_indices] for state in actor_states]
+        actor_states = [state[None] if state.ndim == 1 else state for state in actor_states]
+        frame_count = actor_states[0].shape[0]
+        if any(state.shape[0] != frame_count for state in actor_states):
+            raise ValueError("All actor state arrays must have the same frame count.")
+
+        sizes = torch.tensor([self.sizes], dtype=torch.float32, device=self.device).repeat(frame_count, 1)
+        positions = torch.as_tensor(
+            np.concatenate([state[:, 0:3] for state in actor_states], axis=1),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        rotations = torch.as_tensor(
+            np.concatenate([_quat_wxyz_to_rotation_6d(state[:, 3:7]) for state in actor_states], axis=1),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        map4d = build_stackcube_template_map(sizes=sizes, positions=positions, rotations=rotations, device=self.device)
+        map4d.gt_actor_names = self.actor_names
+        map4d.gt_actor_states = actor_states
+        return map4d
+
+
 def build_stackcube_template_map(*, sizes=None, positions=None, rotations=None, device: str = "cpu"):
     import torch
     from maniskill_stackcube import Map4d_StackCube
 
     if sizes is None:
         sizes = torch.tensor(
-            [[0.04, 0.04, 0.04, 0.04, 0.04, 0.04, 0.02, 0.5, 0.5]],
+            [STACKCUBE_GT_SIZES_MANISKILL_XYZ],
             dtype=torch.float32,
             device=device,
         )
@@ -934,6 +1010,25 @@ def build_stackcube_template_map(*, sizes=None, positions=None, rotations=None, 
                 device=device,
             )
     return Map4d_StackCube(sizes, positions, rotations, clip_model=None, preprocess=False)
+
+
+def _quat_wxyz_to_rotation_6d(quat_wxyz: np.ndarray) -> np.ndarray:
+    quat = np.asarray(quat_wxyz, dtype=np.float32)
+    if quat.ndim != 2 or quat.shape[1] != 4:
+        raise ValueError(f"Expected quaternion shape [T, 4], got {quat.shape}")
+    quat = quat / np.linalg.norm(quat, axis=1, keepdims=True).clip(min=1e-8)
+    w, x, y, z = quat[:, 0], quat[:, 1], quat[:, 2], quat[:, 3]
+    matrix = np.empty((quat.shape[0], 3, 3), dtype=np.float32)
+    matrix[:, 0, 0] = 1.0 - 2.0 * (y * y + z * z)
+    matrix[:, 0, 1] = 2.0 * (x * y - z * w)
+    matrix[:, 0, 2] = 2.0 * (x * z + y * w)
+    matrix[:, 1, 0] = 2.0 * (x * y + z * w)
+    matrix[:, 1, 1] = 1.0 - 2.0 * (x * x + z * z)
+    matrix[:, 1, 2] = 2.0 * (y * z - x * w)
+    matrix[:, 2, 0] = 2.0 * (x * z - y * w)
+    matrix[:, 2, 1] = 2.0 * (y * z + x * w)
+    matrix[:, 2, 2] = 1.0 - 2.0 * (x * x + y * y)
+    return np.concatenate([matrix[:, :, 0], matrix[:, :, 1]], axis=1).astype(np.float32)
 
 
 def instantiate_stackcube_map(

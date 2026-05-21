@@ -1,4 +1,5 @@
 from .map_constructor import (
+    ManiSkillGTMap4dConstructor,
     Map4dConstructor,
     Map4dSingleFrameConstructor,
     ObjectConstructionResult,
@@ -23,6 +24,7 @@ from .structural_parameter_estimator import (
 __all__ = [
     "Map4dConstructor",
     "Map4dSingleFrameConstructor",
+    "ManiSkillGTMap4dConstructor",
     "ObjectConstructionResult",
     "PointNetEncoder",
     "STRUCTURAL_MAP_CLASS_VOCAB",

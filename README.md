@@ -43,6 +43,12 @@ python -m mani_skill.trajectory.replay_trajectory \
 --save-traj \
 -n 1
 
+# convert to lerobot format
+python -m mani_skill.trajectory.convert_to_lerobot \
+--traj-path /inspire/hdd/project/robot-dna/baojiachun-CZXS25130063/zehao/4dmap/dataset/ManiSkill/StackCube-v1/motionplanning/StackCube.rgb+depth+segmentation.pd_ee_delta_pose.physx_cpu.h5 \
+--output-dir /inspire/hdd/project/robot-dna/baojiachun-CZXS25130063/zehao/4dmap/4dmap_policy/dataset/maniskill \
+--fps 30
+
 # --count 100
 ```
 
@@ -61,35 +67,4 @@ python train_rgbd.py --env-id StackCube-v1 \
 
 ## requirements
 
-for dp, you only need to install requirements regarding **maniskill** and **diffusion policy** like diffusers.
-
-```bash
-######################### cuda 12.8
-
-# pytorch
-pip install torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1 --index-url https://download.pytorch.org/whl/cu128
-# pytorch-geometric
-pip install torch_geometric
-pip install pyg_lib torch_scatter torch_sparse torch_cluster torch_spline_conv -f https://data.pyg.org/whl/torch-2.7.0+cu128.html
-# pytorch3d
-pip install git+https://github.com/facebookresearch/pytorch3d.git@stable --no-build-isolation
-
-# image processing
-pip install opencv-python imageio
-
-# 3d utils
-pip install open3d trimesh
-
-# clip
-pip install ftfy regex tqdm
-pip install git+https://github.com/openai/CLIP.git
-
-# diffusers
-pip install diffusers
-
-### benchmark
-# maniskill
-pip install mani_skill
-pip install numpy==1.26.4
-
-```
+for dp, you only need to install requirements regarding **maniskill** and **diffusion policy** like diffusers in ```requirements.txt```.

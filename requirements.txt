@@ -1,0 +1,51 @@
+######################### cuda 12.8
+
+# pytorch
+pip install torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1 --index-url https://download.pytorch.org/whl/cu128
+# pytorch-geometric
+pip install torch_geometric
+pip install pyg_lib torch_scatter torch_sparse torch_cluster torch_spline_conv -f https://data.pyg.org/whl/torch-2.7.0+cu128.html
+# pytorch3d
+pip install git+https://github.com/facebookresearch/pytorch3d.git@stable --no-build-isolation
+
+# tensorboard
+pip install tensorboard
+
+# image processing
+pip install opencv-python imageio transformations matplotlib pyrender pyOpenGL pyOpenGL_accelerate
+pip install open3d trimesh
+
+
+# clip
+pip install ftfy regex tqdm
+pip install git+https://github.com/openai/CLIP.git
+
+# Grounded SAM 2
+cd map4d/construction/SAM2/sam2
+pip install -e . --no-build-isolation
+cd ../../..
+pip install transformers yapf timm supervision pycocotools # grounding dino
+
+
+# foundationpose
+conda install conda-forge::eigen=3.4.0 -y
+pip install pybind11 scikit-image
+python -m pip install --no-build-isolation "git+https://github.com/NVlabs/nvdiffrast.git"
+export pybind11_DIR=/inspire/hdd/project/robot-dna/baojiachun-CZXS25130063/miniconda3/envs/4dmap/lib/python3.11/site-packages/pybind11/share/cmake/pybind11
+CMAKE_PREFIX_PATH=$CONDA_PREFIX/lib/python3.10/site-packages/pybind11/share/cmake/pybind11 bash build_all_conda.sh
+
+
+# diffusers
+pip install diffusers
+
+
+# lerobot
+pip install lerobot
+
+# others
+pip install wandb kornia omegaconf psutil tqdm warp-lang
+
+### benchmark
+# maniskill
+pip install mani_skill
+pip install numpy==1.26.4
