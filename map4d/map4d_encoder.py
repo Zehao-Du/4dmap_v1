@@ -4,6 +4,7 @@ import torch
 
 from .construction import Map4dConstructor, build_stackcube_template_map
 from .encoder.geometric_encoder import GeometricEncoder
+from .representation.maps4d.utils_torch import rotation_6d_to_matrix
 
 
 class Map4d_Encoder(nn.Module):
@@ -37,7 +38,14 @@ class Map4d_Encoder(nn.Module):
             feature_dim=feature_dim,
         )
         self.feature_dim = getattr(self.encoder, "feature_dim", feature_dim)
-        self.future_head = nn.Linear(self.feature_dim, self.future_horizon * self.num_objects * 9)
+        self.future_heads = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(self.feature_dim, self.feature_dim),
+                nn.ReLU(),
+                nn.Linear(self.feature_dim, self.future_horizon * 9),
+            )
+            for _ in range(self.num_objects)
+        ])
 
     def forward(self, map4d_seq=None, rgb=None, depth=None, camera_intrinsics=None, **construction_kwargs):
         '''
@@ -70,20 +78,40 @@ class Map4d_Encoder(nn.Module):
 
     def predict_future_from_features(self, obj_feat, sizes, positions, rotations, future_sizes, future_positions, future_rotations):
         batch_size = obj_feat.shape[0]
-        pred_delta = self.future_head(obj_feat[:, -1].mean(dim=1))
-        pred_delta = pred_delta.view(batch_size, self.future_horizon, self.num_objects, 9)
+        # Per-object prediction from per-object features (last frame)
+        preds = []
+        for i, head in enumerate(self.future_heads):
+            preds.append(head(obj_feat[:, -1, i]))  # [B, future_horizon * 9]
+        pred_delta = torch.stack(preds, dim=1)  # [B, N, future_horizon * 9]
+        pred_delta = pred_delta.view(batch_size, self.num_objects, self.future_horizon, 9)
+        pred_delta = pred_delta.transpose(1, 2)  # [B, future_horizon, N, 9]
         pred_delta_pos = pred_delta[..., :3]
         pred_delta_rot = pred_delta[..., 3:]
+
+        # Position: cumsum from last observed position
         pred_pos = positions[:, -1:] + torch.cumsum(pred_delta_pos, dim=1)
-        pred_rot = rotations[:, -1:] + torch.cumsum(pred_delta_rot, dim=1)
+
+        # Rotation: iterative matrix composition
+        R_last = rotation_6d_to_matrix(rotations[:, -1])  # [B, N, 3, 3]
+        pred_delta_R = rotation_6d_to_matrix(pred_delta_rot)  # [B, H, N, 3, 3]
+        pred_R_list = []
+        R_cur = R_last
+        for t in range(self.future_horizon):
+            R_cur = pred_delta_R[:, t] @ R_cur
+            pred_R_list.append(R_cur)
+        pred_rot_matrices = torch.stack(pred_R_list, dim=1)  # [B, H, N, 3, 3]
+
+        # GT
         gt_sizes = torch.cat([sizes[:, -1:], future_sizes[:, : self.future_horizon]], dim=1)
         gt_positions = torch.cat([positions[:, -1:], future_positions[:, : self.future_horizon]], dim=1)
         gt_rotations = torch.cat([rotations[:, -1:], future_rotations[:, : self.future_horizon]], dim=1)
+
         return {
             "pred_delta_pos": pred_delta_pos,
             "pred_delta_rot": pred_delta_rot,
             "pred_pos": pred_pos,
-            "pred_rot": pred_rot,
+            "pred_rot": pred_delta_rot,
+            "pred_rot_matrices": pred_rot_matrices,
             "valid_mask": torch.ones((batch_size, pred_pos.shape[1], self.num_objects), device=pred_pos.device),
             "sizes": gt_sizes,
             "positions": gt_positions,

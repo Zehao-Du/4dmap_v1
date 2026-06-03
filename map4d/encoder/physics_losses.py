@@ -14,14 +14,11 @@ class PhysicsLosses(nn.Module):
         pose_weight: float = 1.0,
         penetration_weight: float = 0.1,
         kinematic_weight: float = 0.1,
-        pointcloud_weight: float = 0.1,
         vel_limit: float = 0.5,
         acc_limit: float = 1.0,
         rot_vel_limit: float = 1.0,
         rot_acc_limit: float = 2.0,
         penetration_margin: float = 0.0,
-        pointcloud_margin: float = 0.002,
-        pointcloud_samples: int = 64,
     ):
         super().__init__()
         if num_objects <= 0:
@@ -30,14 +27,11 @@ class PhysicsLosses(nn.Module):
         self.pose_weight = pose_weight
         self.penetration_weight = penetration_weight
         self.kinematic_weight = kinematic_weight
-        self.pointcloud_weight = pointcloud_weight
         self.vel_limit = vel_limit
         self.acc_limit = acc_limit
         self.rot_vel_limit = rot_vel_limit
         self.rot_acc_limit = rot_acc_limit
         self.penetration_margin = penetration_margin
-        self.pointcloud_margin = pointcloud_margin
-        self.pointcloud_samples = pointcloud_samples
         self.register_buffer(
             "box_corners",
             torch.tensor(
@@ -75,10 +69,15 @@ class PhysicsLosses(nn.Module):
             return _zero_losses(positions)
 
         gt_delta_pos = positions[:, 1:] - positions[:, :-1]
-        gt_delta_rot = rotations[:, 1:] - rotations[:, :-1]
 
-        pose_loss = F.l1_loss(pred_delta_pos, gt_delta_pos) + F.l1_loss(
-            pred_delta_rot, gt_delta_rot
+        R_curr = rotation_6d_to_matrix(rotations[:, :-1])
+        R_next = rotation_6d_to_matrix(rotations[:, 1:])
+        gt_delta_R = R_next @ R_curr.transpose(-1, -2)
+
+        pred_delta_R = rotation_6d_to_matrix(pred_delta_rot)
+
+        pose_loss = F.l1_loss(pred_delta_pos, gt_delta_pos) + F.mse_loss(
+            pred_delta_R, gt_delta_R
         )
 
         kinematic_loss = _kinematic_loss(
@@ -98,26 +97,16 @@ class PhysicsLosses(nn.Module):
             self.box_corners,
         )
 
-        pointcloud_loss = _pointcloud_loss(
-            pred_pos,
-            pred_rot,
-            sizes[:, 1:],
-            self.pointcloud_samples,
-            self.pointcloud_margin,
-        )
-
         total = (
             self.pose_weight * pose_loss
             + self.kinematic_weight * kinematic_loss
             + self.penetration_weight * penetration_loss
-            + self.pointcloud_weight * pointcloud_loss
         )
 
         return {
             "pose": pose_loss,
             "kinematic": kinematic_loss,
             "penetration": penetration_loss,
-            "point_cloud": pointcloud_loss,
             "total": total,
         }
 
@@ -128,7 +117,6 @@ def _zero_losses(ref):
         "pose": torch.tensor(0.0, device=device),
         "kinematic": torch.tensor(0.0, device=device),
         "penetration": torch.tensor(0.0, device=device),
-        "point_cloud": torch.tensor(0.0, device=device),
         "total": torch.tensor(0.0, device=device),
     }
 
@@ -205,63 +193,3 @@ def _box_vertices(positions, rotations, sizes, corners):
     verts = torch.matmul(verts, rot_mats.transpose(1, 2))
     verts = verts + pos_flat.unsqueeze(1)
     return verts.view(B, T, N, 8, 3)
-
-
-def _pointcloud_loss(positions, rotations, sizes, num_points, margin):
-    if num_points <= 0 or positions is None or positions.shape[1] == 0:
-        return torch.tensor(0.0, device=sizes.device)
-
-    B, T, N, _ = positions.shape
-    if N < 2:
-        return torch.tensor(0.0, device=positions.device)
-
-    points = _sample_surface_points(
-        positions, rotations, sizes, num_points
-    )
-
-    total = 0.0
-    pairs = 0
-    for i in range(N):
-        for j in range(i + 1, N):
-            pts_i = points[:, :, i]
-            pts_j = points[:, :, j]
-            dists = torch.cdist(pts_i, pts_j)
-            min_dist = dists.min(dim=-1).values.min(dim=-1).values
-            penalty = F.relu(margin - min_dist).mean()
-            total = total + penalty
-            pairs += 1
-
-    return total / max(pairs, 1)
-
-
-def _sample_surface_points(positions, rotations, sizes, num_points):
-    B, T, N, _ = positions.shape
-    device = positions.device
-    dtype = positions.dtype
-
-    rand = torch.rand((B, T, N, num_points, 3), device=device, dtype=dtype) - 0.5
-    faces = torch.randint(0, 6, (B, T, N, num_points), device=device)
-
-    x_face = faces == 0
-    x_face_neg = faces == 1
-    y_face = faces == 2
-    y_face_neg = faces == 3
-    z_face = faces == 4
-    z_face_neg = faces == 5
-
-    rand[..., 0] = torch.where(x_face, 0.5, rand[..., 0])
-    rand[..., 0] = torch.where(x_face_neg, -0.5, rand[..., 0])
-    rand[..., 1] = torch.where(y_face, 0.5, rand[..., 1])
-    rand[..., 1] = torch.where(y_face_neg, -0.5, rand[..., 1])
-    rand[..., 2] = torch.where(z_face, 0.5, rand[..., 2])
-    rand[..., 2] = torch.where(z_face_neg, -0.5, rand[..., 2])
-
-    local = rand * sizes.unsqueeze(-2)
-    flat = B * T * N
-    local = local.reshape(flat, num_points, 3)
-    rot_flat = rotations.reshape(flat, 6)
-    pos_flat = positions.reshape(flat, 3)
-
-    rot_mats = rotation_6d_to_matrix(rot_flat)
-    pts = torch.matmul(local, rot_mats.transpose(1, 2)) + pos_flat.unsqueeze(1)
-    return pts.view(B, T, N, num_points, 3)

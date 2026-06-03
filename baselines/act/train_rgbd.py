@@ -26,7 +26,25 @@ from torch.utils.data.sampler import RandomSampler, BatchSampler
 from torch.utils.data.dataloader import DataLoader
 from act.utils import IterationBasedBatchSampler, worker_init_fn
 from act.make_env import make_eval_envs
-from diffusers.training_utils import EMAModel
+try:
+    from diffusers.training_utils import EMAModel
+except (ImportError, RuntimeError):
+    class EMAModel:
+        """Small fallback used when diffusers' optional training imports are broken."""
+
+        def __init__(self, parameters, power=0.75):
+            self.decay = float(power)
+            self.shadow_params = [p.detach().clone() for p in parameters]
+
+        def step(self, parameters):
+            with torch.no_grad():
+                for shadow, param in zip(self.shadow_params, parameters):
+                    shadow.mul_(self.decay).add_(param.detach(), alpha=1.0 - self.decay)
+
+        def copy_to(self, parameters):
+            with torch.no_grad():
+                for shadow, param in zip(self.shadow_params, parameters):
+                    param.copy_(shadow)
 from act.detr.backbone import build_backbone
 from act.detr.transformer import build_transformer
 from act.detr.detr_vae import build_encoder, DETRVAE
@@ -382,7 +400,7 @@ class Agent(nn.Module):
             obs['depth'] = obs['depth'].float()
 
         # forward pass
-        a_hat, (mu, logvar) = self.model(obs, action_seq)
+        a_hat, (mu, logvar), _ = self.model(obs, action_seq)
 
         # compute l1 loss and kl loss
         total_kld, dim_wise_kld, mean_kld = kl_divergence(mu, logvar)
@@ -406,7 +424,7 @@ class Agent(nn.Module):
             obs['depth'] = obs['depth'].float()
 
         # forward pass
-        a_hat, (_, _) = self.model(obs) # no action, sample from prior
+        a_hat, (_, _), _ = self.model(obs) # no action, sample from prior
 
         return a_hat
 

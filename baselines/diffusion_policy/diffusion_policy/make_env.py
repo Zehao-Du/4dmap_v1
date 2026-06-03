@@ -42,7 +42,9 @@ def _quat_wxyz_to_rotation_6d(quat_wxyz):
 
 
 class ManiSkillGTMap4dObservationWrapper(gym.Wrapper):
-    """Inject StackCube GT 4D map tensors into FrameStack observations."""
+    """Inject GT 4D map tensors into FrameStack observations."""
+
+    TASK_NUM_OBJECTS = {"StackCube-v1": 3, "PlugCharger-v1": 2}
 
     def __init__(
         self,
@@ -52,11 +54,13 @@ class ManiSkillGTMap4dObservationWrapper(gym.Wrapper):
         task_name: str = "StackCube-v1",
         strict: bool = True,
     ):
-        if task_name != "StackCube-v1":
-            raise ValueError("ManiSkillGTMap4dObservationWrapper supports StackCube-v1 only.")
+        if task_name not in self.TASK_NUM_OBJECTS:
+            raise ValueError(f"ManiSkillGTMap4dObservationWrapper does not support {task_name}.")
         super().__init__(env)
         self.obs_horizon = int(obs_horizon)
         self.strict = bool(strict)
+        self.task_name = task_name
+        self.num_objects = self.TASK_NUM_OBJECTS[task_name]
         self._history = []
         self.observation_space = gym.spaces.Dict(
             {
@@ -64,7 +68,7 @@ class ManiSkillGTMap4dObservationWrapper(gym.Wrapper):
                 "map4d": gym.spaces.Box(
                     low=-np.inf,
                     high=np.inf,
-                    shape=(self.obs_horizon, 3, 12),
+                    shape=(self.obs_horizon, self.num_objects, 12),
                     dtype=np.float32,
                 ),
             }
@@ -89,6 +93,8 @@ class ManiSkillGTMap4dObservationWrapper(gym.Wrapper):
 
     def _current_map4d(self):
         env = self.env.unwrapped
+        if self.task_name == "PlugCharger-v1":
+            return self._map4d_plugcharger(env)
         try:
             cube_a = self._actor_state(getattr(env, "cubeA"))
             cube_b = self._actor_state(getattr(env, "cubeB"))
@@ -104,6 +110,17 @@ class ManiSkillGTMap4dObservationWrapper(gym.Wrapper):
             table = STACKCUBE_FALLBACK_TABLE_STATE
             sizes = STACKCUBE_FALLBACK_SIZES
         states = [cube_a, cube_b, table]
+        positions = np.stack([state[:3] for state in states], axis=0)
+        rotations = np.stack([_quat_wxyz_to_rotation_6d(state[3:7])[0] for state in states], axis=0)
+        return np.concatenate([sizes, positions, rotations], axis=-1).astype(np.float32)
+
+    def _map4d_plugcharger(self, env):
+        charger = self._actor_state(env.charger)
+        receptacle = self._actor_state(env.receptacle)
+        base_size = np.asarray(env._base_size, dtype=np.float32) * 2.0
+        receptacle_size = np.asarray(env._receptacle_size, dtype=np.float32) * 2.0
+        sizes = np.stack([base_size, receptacle_size], axis=0)
+        states = [charger, receptacle]
         positions = np.stack([state[:3] for state in states], axis=0)
         rotations = np.stack([_quat_wxyz_to_rotation_6d(state[3:7])[0] for state in states], axis=0)
         return np.concatenate([sizes, positions, rotations], axis=-1).astype(np.float32)
@@ -130,7 +147,7 @@ class ManiSkillGTMap4dObservationWrapper(gym.Wrapper):
         table_scene = getattr(env, "table_scene", None)
         table_actor = getattr(table_scene, "table", None)
         if table_actor is None:
-            return STACKCUBE_FALLBACK_TABLE_STATE
+            raise AttributeError("StackCube table actor is required for GT map4d.")
         return cls._actor_state(table_actor)
 
     @staticmethod

@@ -22,7 +22,7 @@ def evaluate(n: int, agent, eval_envs, eval_kwargs):
     num_envs = eval_envs.num_envs
     if temporal_agg:
         query_frequency = 1
-        all_time_actions = torch.zeros([num_envs, max_timesteps, max_timesteps+num_queries, action_dim], device=device)
+        all_time_actions = torch.zeros([num_envs, max_timesteps+1, max_timesteps+1+num_queries, action_dim], device=device)
     else:
         query_frequency = num_queries
         actions_to_take = torch.zeros([num_envs, num_queries, action_dim], device=device)
@@ -54,7 +54,7 @@ def evaluate(n: int, agent, eval_envs, eval_kwargs):
                 actions_for_curr_step = all_time_actions[:, :, ts] # (num_envs, max_timesteps, act_dim)
                 # since we pad the action with 0 in 'delta_pos' control mode, this causes error.
                 #actions_populated = torch.all(actions_for_curr_step[0] != 0, axis=1) # (max_timesteps,)
-                actions_populated = torch.zeros(max_timesteps, dtype=torch.bool, device=device) # (max_timesteps,)
+                actions_populated = torch.zeros(max_timesteps+1, dtype=torch.bool, device=device)
                 actions_populated[max(0, ts + 1 - num_queries):ts+1] = True
                 actions_for_curr_step = actions_for_curr_step[:, actions_populated] # (num_envs, num_populated, act_dim)
                 k = 0.01
@@ -80,17 +80,23 @@ def evaluate(n: int, agent, eval_envs, eval_kwargs):
             # collect episode info
             if truncated.any():
                 assert truncated.all() == truncated.any(), "all episodes should truncate at the same time for fair evaluation with other algorithms"
-                if isinstance(info["final_info"], dict):
+                if "final_info" in info and isinstance(info["final_info"], dict):
                     for k, v in info["final_info"]["episode"].items():
                         eval_metrics[k].append(v.float().cpu().numpy())
-                else:
+                elif "final_info" in info:
                     for final_info in info["final_info"]:
                         for k, v in final_info["episode"].items():
                             eval_metrics[k].append(v)
+                else:
+                    for k, v in info["episode"].items():
+                        if isinstance(v, np.ndarray):
+                            eval_metrics[k].append(v)
+                        else:
+                            eval_metrics[k].append(v.float().cpu().numpy())
                 # new episodes begin
                 eps_count += num_envs
                 ts = 0
-                all_time_actions = torch.zeros([num_envs, max_timesteps, max_timesteps+num_queries, action_dim], device=device)
+                all_time_actions = torch.zeros([num_envs, max_timesteps+1, max_timesteps+1+num_queries, action_dim], device=device)
 
     agent.train()
     for k in eval_metrics.keys():

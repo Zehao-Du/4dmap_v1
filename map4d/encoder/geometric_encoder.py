@@ -34,19 +34,8 @@ class GeometricEncoder(nn.Module):
         self.temporal_gru = nn.GRU(node_dim, temporal_dim, batch_first=True)
         self.obj_proj = nn.Linear(temporal_dim, feature_dim)
         self.scene_proj = nn.Linear(feature_dim, feature_dim)
-        self.pred_head = nn.Sequential(
-            nn.Linear(feature_dim, feature_dim),
-            nn.ReLU(),
-            nn.Linear(feature_dim, 9),
-        )
-
     def forward(self, map4d_seq):
         return self.encode_sequence(map4d_seq)
-
-    def forward_with_prediction(self, map4d_seq):
-        map_feature_seq, obj_feat, scene_feat, sizes, positions, rotations = self._encode_sequence_parts(map4d_seq)
-        pred = self.predict_pose_deltas(obj_feat, sizes, positions, rotations, scene_feat)
-        return map_feature_seq, pred
 
     def encode_sequence(self, rep_seq):
         map_feature_seq, *_ = self._encode_sequence_parts(rep_seq)
@@ -91,34 +80,6 @@ class GeometricEncoder(nn.Module):
         map_feature_seq = self.scene_proj(scene_feat)
         return map_feature_seq, obj_feat, scene_feat, sizes, positions, rotations
 
-    def predict_pose_deltas(self, obj_feat, sizes, positions, rotations, scene_feat):
-        B, T, N, _ = positions.shape
-        if T > 1:
-            pred_delta = self.pred_head(obj_feat[:, :-1])
-            pred_delta_pos = pred_delta[..., :3]
-            pred_delta_rot = pred_delta[..., 3:]
-            pred_pos = positions[:, :-1] + pred_delta_pos
-            pred_rot = rotations[:, :-1] + pred_delta_rot
-            valid_mask = torch.ones((B, T - 1, N), device=positions.device)
-        else:
-            pred_delta_pos = positions.new_zeros((B, 0, N, 3))
-            pred_delta_rot = rotations.new_zeros((B, 0, N, 6))
-            pred_pos = positions.new_zeros((B, 0, N, 3))
-            pred_rot = rotations.new_zeros((B, 0, N, 6))
-            valid_mask = positions.new_zeros((B, 0, N))
-
-        return {
-            "pred_delta_pos": pred_delta_pos,
-            "pred_delta_rot": pred_delta_rot,
-            "pred_pos": pred_pos,
-            "pred_rot": pred_rot,
-            "valid_mask": valid_mask,
-            "sizes": sizes,
-            "positions": positions,
-            "rotations": rotations,
-            "object_features": obj_feat,
-            "scene_features": scene_feat,
-        }
 
 
 def _parse_representation(rep_seq, num_objects: int):

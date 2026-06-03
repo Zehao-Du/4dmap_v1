@@ -46,12 +46,27 @@ class Transformer(nn.Module):
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
 
-    def forward(self, src, mask, query_embed, pos_embed, latent_input=None, proprio_input=None, additional_pos_embed=None):
+    def forward(
+        self,
+        src,
+        mask,
+        query_embed,
+        pos_embed,
+        latent_input=None,
+        proprio_input=None,
+        context_input=None,
+        additional_pos_embed=None,
+        map4d_tokens_seq=None,
+        map4d_tokens_pos=None,
+    ):
         if src is None:
             bs = proprio_input.shape[0]
             query_embed = query_embed.unsqueeze(1).repeat(1, bs, 1)
             pos_embed = additional_pos_embed.unsqueeze(1).repeat(1, bs, 1) # seq, bs, dim
-            src = torch.stack([latent_input, proprio_input], axis=0)
+            addition_inputs = [latent_input, proprio_input]
+            if context_input is not None:
+                addition_inputs.append(context_input)
+            src = torch.stack(addition_inputs, axis=0)
         # TODO flatten only when input has H and W
         elif len(src.shape) == 4: # has H and W
             # flatten NxCxHxW to HWxNxC
@@ -64,15 +79,27 @@ class Transformer(nn.Module):
             additional_pos_embed = additional_pos_embed.unsqueeze(1).repeat(1, bs, 1) # seq, bs, dim
             pos_embed = torch.cat([additional_pos_embed, pos_embed], axis=0)
 
-            addition_input = torch.stack([latent_input, proprio_input], axis=0)
+            addition_inputs = [latent_input, proprio_input]
+            if context_input is not None:
+                addition_inputs.append(context_input)
+            addition_input = torch.stack(addition_inputs, axis=0)
             src = torch.cat([addition_input, src], axis=0)
+
+        # Append map4d tokens to src if provided
+        if map4d_tokens_seq is not None:
+            # map4d_tokens_seq: (batch, T*N, hidden_dim) → (T*N, batch, hidden_dim)
+            tokens = map4d_tokens_seq.permute(1, 0, 2)
+            src = torch.cat([src, tokens], axis=0)
+            # map4d_tokens_pos: (batch, T*N, hidden_dim) → (T*N, batch, hidden_dim)
+            tokens_pos = map4d_tokens_pos.permute(1, 0, 2)
+            pos_embed = torch.cat([pos_embed, tokens_pos], axis=0)
 
         tgt = torch.zeros_like(query_embed)
         memory = self.encoder(src, src_key_padding_mask=mask, pos=pos_embed)
         hs = self.decoder(tgt, memory, memory_key_padding_mask=mask,
                           pos=pos_embed, query_pos=query_embed)
         hs = hs.transpose(1, 2)
-        return hs
+        return hs, memory
 
 
 class TransformerEncoder(nn.Module):

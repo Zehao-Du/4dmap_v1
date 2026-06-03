@@ -1,5 +1,6 @@
 ALGO_NAME = "BC_Diffusion_rgbd_UNet"
 
+import json
 import os
 import random
 import sys
@@ -57,6 +58,7 @@ from diffusion_policy.conditional_unet1d import ConditionalUnet1D
 from diffusion_policy.evaluate import evaluate
 from diffusion_policy.make_env import make_eval_envs
 from diffusion_policy.plain_conv import PlainConv
+from diffusion_policy.dinov3_encoder import DinoV3VisualEncoder
 from diffusion_policy.utils import (IterationBasedBatchSampler,
                                     build_state_obs_extractor, convert_obs,
                                     worker_init_fn)
@@ -128,6 +130,12 @@ class Args:
     # Map4D encoder/loss arguments
     use_map4d: bool = False
     """whether to fuse map4d features and physics losses"""
+    map4d_raw_concat: bool = False
+    """bypass encoder: flatten raw map4d and concat to state directly"""
+    map4d_aux_loss: bool = False
+    """add auxiliary future prediction loss on obs_cond feature (raw_concat mode)"""
+    map4d_aux_weight: float = 1.0
+    """weight for auxiliary future prediction loss"""
     map4d_num_objects: int = 3
     """number of objects in the 4d map representation"""
     map4d_feature_dim: int = 128
@@ -135,7 +143,11 @@ class Args:
     map4d_node_dim: int = 128
     map4d_relation_dim: int = 64
     map4d_temporal_dim: int = 128
+    map4d_encoder_type: str = "gru"
+    """encoder backbone: 'gru' or 'transformer'"""
     map4d_future_horizon: int = 1
+    map4d_pre_horizon: Optional[int] = None
+    """temporal input window for map4d encoder; defaults to obs_horizon if None"""
     map4d_source: str = "maniskill_gt"
     """source of map4d observations; v1 supports maniskill_gt for StackCube-v1"""
     map4d_task_name: str = "StackCube-v1"
@@ -145,14 +157,17 @@ class Args:
     map4d_pose_weight: float = 1.0
     map4d_penetration_weight: float = 0.1
     map4d_kinematic_weight: float = 0.1
-    map4d_pointcloud_weight: float = 0.1
     map4d_vel_limit: float = 0.5
     map4d_acc_limit: float = 1.0
     map4d_rot_vel_limit: float = 1.0
     map4d_rot_acc_limit: float = 2.0
     map4d_penetration_margin: float = 0.0
-    map4d_pointcloud_margin: float = 0.002
-    map4d_pointcloud_samples: int = 64
+
+    # Visual encoder arguments
+    visual_encoder: str = "plain_conv"
+    """which RGB encoder to use: 'plain_conv' or 'dinov3_vits16'"""
+    dinov3_weights_path: str = "/inspire/hdd/project/robot-dna/baojiachun-CZXS25130063/zehao/4dmap/4dmap_policy/checkpoints/dinov3/dinov3_vits16_pretrain_lvd1689m-08c60483.pth"
+    dinov3_third_party_dir: str = "/inspire/hdd/project/robot-dna/baojiachun-CZXS25130063/zehao/4dmap/4dmap_policy/third_party/dinov3"
 
     # Environment/experiment specific arguments
     obs_mode: str = "rgb+depth"
@@ -237,14 +252,18 @@ def _quat_wxyz_to_rotation_6d_np(quat_wxyz):
 def _actor_states_to_map4d_tensor(
     actor_states,
     *,
-    sizes=STACKCUBE_GT_SIZES_MANISKILL_XYZ,
+    sizes=None,
 ):
     states = [np.asarray(state, dtype=np.float32) for state in actor_states]
+    num_objects = len(states)
     frame_count = states[0].shape[0]
     if any(state.shape[0] != frame_count for state in states):
         raise ValueError("All actor state arrays must have the same frame count.")
-    sizes_np = np.asarray(sizes, dtype=np.float32).reshape(3, 3)
-    sizes_seq = np.broadcast_to(sizes_np, (frame_count, 3, 3))
+    if sizes is not None:
+        sizes_np = np.asarray(sizes, dtype=np.float32).reshape(num_objects, 3)
+    else:
+        sizes_np = np.zeros((num_objects, 3), dtype=np.float32)
+    sizes_seq = np.broadcast_to(sizes_np, (frame_count, num_objects, 3))
     positions = np.stack([state[:, 0:3] for state in states], axis=1)
     rotations = np.stack(
         [_quat_wxyz_to_rotation_6d_np(state[:, 3:7]) for state in states],
@@ -258,11 +277,22 @@ def _load_maniskill_gt_map4d_tensors(
     *,
     num_traj=None,
     task_name="StackCube-v1",
-    actor_names=("cubeA", "cubeB", "table-workspace"),
+    actor_names=None,
     device=None,
 ):
-    if task_name != "StackCube-v1":
-        raise ValueError("map4d_source=maniskill_gt currently supports StackCube-v1 only.")
+    task_actors = {
+        "StackCube-v1": ("cubeA", "cubeB", "table-workspace"),
+        "PlugCharger-v1": ("charger", "receptacle"),
+    }
+    task_sizes = {
+        "StackCube-v1": STACKCUBE_GT_SIZES_MANISKILL_XYZ,
+        "PlugCharger-v1": (0.04, 0.03, 0.024, 0.02, 0.1, 0.1),
+    }
+    if actor_names is None:
+        actor_names = task_actors.get(task_name)
+        if actor_names is None:
+            raise ValueError(f"No default actor_names for task {task_name}.")
+    sizes = task_sizes.get(task_name)
     import h5py
 
     with h5py.File(data_path, "r") as f:
@@ -278,7 +308,7 @@ def _load_maniskill_gt_map4d_tensors(
             if missing:
                 raise KeyError(f"{traj_key} missing ManiSkill GT actors: {missing}")
             actor_states = [actors[name][()] for name in actor_names]
-            map4d_np = _actor_states_to_map4d_tensor(actor_states)
+            map4d_np = _actor_states_to_map4d_tensor(actor_states, sizes=sizes)
             map4d_tensors.append(torch.as_tensor(map4d_np, device=device))
     return map4d_tensors
 
@@ -299,6 +329,7 @@ class SmallDemoDataset_DiffusionPolicy(Dataset):  # Load everything into memory
         map4d_source="maniskill_gt",
         map4d_task_name="StackCube-v1",
         map4d_future_horizon=1,
+        map4d_pre_horizon=None,
         map4d_strict=True,
     ):
         self.include_rgb = include_rgb
@@ -306,6 +337,7 @@ class SmallDemoDataset_DiffusionPolicy(Dataset):  # Load everything into memory
         self.use_map4d = use_map4d
         self.map4d_source = map4d_source
         self.map4d_future_horizon = int(map4d_future_horizon)
+        self.map4d_pre_horizon = map4d_pre_horizon
         self.map4d_strict = map4d_strict
         from diffusion_policy.utils import load_demo_dataset
         trajectories = load_demo_dataset(data_path, num_traj=num_traj, concat=False)
@@ -387,6 +419,7 @@ class SmallDemoDataset_DiffusionPolicy(Dataset):  # Load everything into memory
         # Pre-compute all possible (traj_idx, start, end) tuples, this is very specific to Diffusion Policy
         if (
             "delta_pos" in args.control_mode
+            or "delta_pose" in args.control_mode
             or args.control_mode == "base_pd_joint_vel_arm_pd_joint_vel"
         ):
             print("Detected a delta controller type, padding with a zero action to ensure the arm stays still after solving tasks.")
@@ -464,6 +497,10 @@ class SmallDemoDataset_DiffusionPolicy(Dataset):  # Load everything into memory
                     raise KeyError("use_map4d=True but trajectory does not include map4d.")
             else:
                 current_idx = max(0, start + self.obs_horizon - 1)
+                # Slice map4d with map4d_pre_horizon (may be longer than obs_horizon)
+                pre_horizon = self.map4d_pre_horizon or self.obs_horizon
+                map4d_start = current_idx - pre_horizon + 1
+                obs_seq["map4d"] = self._slice_time(obs_traj["map4d"], map4d_start, pre_horizon)
                 obs_seq["future_map4d"] = self._slice_future_time(
                     obs_traj["map4d"],
                     current_idx + 1,
@@ -522,6 +559,7 @@ class Agent(nn.Module):
         self.act_horizon = args.act_horizon
         self.pred_horizon = args.pred_horizon
         self.use_map4d = args.use_map4d
+        self.map4d_raw_concat = args.map4d_raw_concat if args.use_map4d else False
         self.map4d_strict = args.map4d_strict
         assert (
             len(env.single_observation_space["state"].shape) == 2
@@ -544,17 +582,56 @@ class Agent(nn.Module):
 
         visual_feature_dim = 256
         map4d_feature_dim = args.map4d_feature_dim if self.use_map4d else 0
-        self.visual_encoder = PlainConv(
-            in_channels=total_visual_channels, out_dim=visual_feature_dim, pool_feature_map=True
-        )
-        if self.use_map4d:
-            self.map4d_encoder = Map4d_Encoder(
+        self.visual_encoder_kind = args.visual_encoder
+        if self.visual_encoder_kind == "plain_conv":
+            self.visual_encoder = PlainConv(
+                in_channels=total_visual_channels, out_dim=visual_feature_dim, pool_feature_map=True
+            )
+            self.depth_encoder = None
+        elif self.visual_encoder_kind == "dinov3_vits16":
+            assert self.include_rgb, "dinov3_vits16 requires RGB observations"
+            rgb_channels = env.single_observation_space["rgb"].shape[-1]
+            # Support multi-camera RGB by splitting channels into groups of 3 inside forward.
+            assert rgb_channels % 3 == 0, f"RGB channels {rgb_channels} must be multiple of 3"
+            self.num_rgb_cams = rgb_channels // 3
+            rgb_feat = 256
+            self.visual_encoder = DinoV3VisualEncoder(
+                out_dim=rgb_feat,
+                weights_path=args.dinov3_weights_path,
+                third_party_dir=args.dinov3_third_party_dir,
+                model="dinov3_vits16",
+            )
+            if self.include_depth:
+                depth_channels = env.single_observation_space["depth"].shape[-1]
+                depth_feat = 64
+                self.depth_encoder = PlainConv(
+                    in_channels=depth_channels, out_dim=depth_feat, pool_feature_map=True
+                )
+                visual_feature_dim = rgb_feat * self.num_rgb_cams + depth_feat
+            else:
+                self.depth_encoder = None
+                visual_feature_dim = rgb_feat * self.num_rgb_cams
+        else:
+            raise ValueError(f"Unknown visual_encoder {self.visual_encoder_kind!r}")
+        if self.use_map4d and not self.map4d_raw_concat:
+            encoder_kwargs = dict(
                 num_objects=args.map4d_num_objects,
-                pre_horizon=args.obs_horizon,
-                future_horizon=args.map4d_future_horizon,
                 node_dim=args.map4d_node_dim,
                 relation_dim=args.map4d_relation_dim,
                 temporal_dim=args.map4d_temporal_dim,
+                feature_dim=args.map4d_feature_dim,
+            )
+            if args.map4d_encoder_type == "transformer":
+                from map4d.encoder.geometric_transformer_encoder import GeometricTransformerEncoder
+                geo_encoder = GeometricTransformerEncoder(**encoder_kwargs)
+            else:
+                from map4d.encoder.geometric_encoder import GeometricEncoder
+                geo_encoder = GeometricEncoder(**encoder_kwargs)
+            self.map4d_encoder = Map4d_Encoder(
+                encoder=geo_encoder,
+                num_objects=args.map4d_num_objects,
+                pre_horizon=args.map4d_pre_horizon or args.obs_horizon,
+                future_horizon=args.map4d_future_horizon,
                 feature_dim=args.map4d_feature_dim,
             )
             self.map4d_losses = PhysicsLosses(
@@ -562,22 +639,31 @@ class Agent(nn.Module):
                 pose_weight=args.map4d_pose_weight,
                 penetration_weight=args.map4d_penetration_weight,
                 kinematic_weight=args.map4d_kinematic_weight,
-                pointcloud_weight=args.map4d_pointcloud_weight,
                 vel_limit=args.map4d_vel_limit,
                 acc_limit=args.map4d_acc_limit,
                 rot_vel_limit=args.map4d_rot_vel_limit,
                 rot_acc_limit=args.map4d_rot_acc_limit,
                 penetration_margin=args.map4d_penetration_margin,
-                pointcloud_margin=args.map4d_pointcloud_margin,
-                pointcloud_samples=args.map4d_pointcloud_samples,
             )
         else:
             self.map4d_encoder = None
             self.map4d_losses = None
+
+        if self.map4d_raw_concat:
+            raw_map4d_dim = args.map4d_num_objects * 12
+            cond_state_dim = obs_state_dim + raw_map4d_dim
+            cond_map4d_dim = 0
+        elif self.use_map4d:
+            cond_state_dim = obs_state_dim
+            cond_map4d_dim = map4d_feature_dim
+        else:
+            cond_state_dim = obs_state_dim
+            cond_map4d_dim = 0
+
         self.noise_pred_net = ConditionalUnet1D(
-            input_dim=self.act_dim,  # act_horizon is not used (U-Net doesn't care)
+            input_dim=self.act_dim,
             global_cond_dim=self.obs_horizon
-            * (visual_feature_dim + obs_state_dim + map4d_feature_dim),
+            * (visual_feature_dim + cond_state_dim + cond_map4d_dim),
             diffusion_step_embed_dim=args.diffusion_step_embed_dim,
             down_dims=args.unet_dims,
             n_groups=args.n_groups,
@@ -585,31 +671,77 @@ class Agent(nn.Module):
         self.num_diffusion_iters = 100
         self.noise_scheduler = DDPMScheduler(
             num_train_timesteps=self.num_diffusion_iters,
-            beta_schedule="squaredcos_cap_v2",  # has big impact on performance, try not to change
-            clip_sample=True,  # clip output to [-1,1] to improve stability
-            prediction_type="epsilon",  # predict noise (instead of denoised action)
+            beta_schedule="squaredcos_cap_v2",
+            clip_sample=True,
+            prediction_type="epsilon",
         )
 
+        # Auxiliary future prediction head (raw_concat + aux_loss mode)
+        self.map4d_aux_loss = args.map4d_aux_loss if args.use_map4d else False
+        self.map4d_aux_weight = args.map4d_aux_weight
+        if self.map4d_aux_loss:
+            self.future_horizon = args.map4d_future_horizon
+            self.map4d_num_objects = args.map4d_num_objects
+            obs_cond_dim = self.obs_horizon * (visual_feature_dim + cond_state_dim + cond_map4d_dim)
+            self.future_pred_head = nn.Sequential(
+                nn.Linear(obs_cond_dim, 256),
+                nn.ReLU(),
+                nn.Linear(256, self.future_horizon * self.map4d_num_objects * 9),
+            )
+
     def encode_obs(self, obs_seq, eval_mode):
-        if self.include_rgb:
-            rgb = obs_seq["rgb"].float() / 255.0  # (B, obs_horizon, 3*k, H, W)
-            img_seq = rgb
-        if self.include_depth:
-            depth = obs_seq["depth"].float() / 1024.0  # (B, obs_horizon, 1*k, H, W)
-            img_seq = depth
-        if self.include_rgb and self.include_depth:
-            img_seq = torch.cat([rgb, depth], dim=2)  # (B, obs_horizon, C, H, W), C=4*k
-        batch_size = img_seq.shape[0]
-        img_seq = img_seq.flatten(end_dim=1)  # (B*obs_horizon, C, H, W)
-        if hasattr(self, "aug") and not eval_mode:
-            img_seq = self.aug(img_seq)  # (B*obs_horizon, C, H, W)
-        visual_feature = self.visual_encoder(img_seq)  # (B*obs_horizon, D)
-        visual_feature = visual_feature.reshape(
-            batch_size, self.obs_horizon, visual_feature.shape[1]
-        )  # (B, obs_horizon, D)
+        if self.visual_encoder_kind == "dinov3_vits16":
+            assert self.include_rgb
+            rgb = obs_seq["rgb"].float() / 255.0  # (B, ho, 3*k, H, W)
+            batch_size, ho = rgb.shape[0], rgb.shape[1]
+            # Split into per-camera [B*ho*k, 3, H, W], encode, concat features per timestep.
+            rgb_flat = rgb.flatten(end_dim=1)  # (B*ho, 3*k, H, W)
+            H, W = rgb_flat.shape[-2:]
+            rgb_cams = rgb_flat.reshape(batch_size * ho, self.num_rgb_cams, 3, H, W)
+            rgb_cams = rgb_cams.flatten(end_dim=1)  # (B*ho*k, 3, H, W)
+            if hasattr(self, "aug") and not eval_mode:
+                rgb_cams = self.aug(rgb_cams)
+            rgb_feat = self.visual_encoder(rgb_cams)  # (B*ho*k, D_rgb)
+            rgb_feat = rgb_feat.reshape(batch_size * ho, self.num_rgb_cams * rgb_feat.shape[-1])
+            if self.depth_encoder is not None:
+                depth = obs_seq["depth"].float() / 1024.0  # (B, ho, 1*k, H, W)
+                depth_flat = depth.flatten(end_dim=1)
+                if hasattr(self, "aug") and not eval_mode:
+                    depth_flat = self.aug(depth_flat)
+                depth_feat = self.depth_encoder(depth_flat)  # (B*ho, D_d)
+                visual_feature = torch.cat([rgb_feat, depth_feat], dim=-1)
+            else:
+                visual_feature = rgb_feat
+            visual_feature = visual_feature.reshape(batch_size, ho, visual_feature.shape[-1])
+        else:
+            if self.include_rgb:
+                rgb = obs_seq["rgb"].float() / 255.0  # (B, obs_horizon, 3*k, H, W)
+                img_seq = rgb
+            if self.include_depth:
+                depth = obs_seq["depth"].float() / 1024.0  # (B, obs_horizon, 1*k, H, W)
+                img_seq = depth
+            if self.include_rgb and self.include_depth:
+                img_seq = torch.cat([rgb, depth], dim=2)  # (B, obs_horizon, C, H, W), C=4*k
+            batch_size = img_seq.shape[0]
+            img_seq = img_seq.flatten(end_dim=1)  # (B*obs_horizon, C, H, W)
+            if hasattr(self, "aug") and not eval_mode:
+                img_seq = self.aug(img_seq)  # (B*obs_horizon, C, H, W)
+            visual_feature = self.visual_encoder(img_seq)  # (B*obs_horizon, D)
+            visual_feature = visual_feature.reshape(
+                batch_size, self.obs_horizon, visual_feature.shape[1]
+            )  # (B, obs_horizon, D)
         map_feature = None
         map_aux = None
-        if self.use_map4d and ("map4d" in obs_seq):
+        if self.map4d_raw_concat and ("map4d" in obs_seq):
+            # Flatten last obs_horizon frames of map4d and concat to state
+            map4d = obs_seq["map4d"]  # (B, obs_horizon, N, 12)
+            if map4d.dim() == 4:
+                raw_map4d = map4d[:, -self.obs_horizon:].flatten(start_dim=2)  # (B, obs_horizon, N*12)
+            else:
+                raw_map4d = map4d.flatten(start_dim=2)[:, -self.obs_horizon:]
+            state_with_map4d = torch.cat([obs_seq["state"], raw_map4d], dim=-1)
+            feature = torch.cat((visual_feature, state_with_map4d), dim=-1)
+        elif self.use_map4d and not self.map4d_raw_concat and ("map4d" in obs_seq):
             if eval_mode:
                 map_feature = self.map4d_encoder(map4d_seq=obs_seq["map4d"])
             else:
@@ -617,6 +749,12 @@ class Agent(nn.Module):
                     map4d_seq=obs_seq["map4d"],
                     future_map4d_seq=obs_seq.get("future_map4d"),
                 )
+            # Slice to obs_horizon (take last obs_horizon frames which carry full GRU context)
+            if map_feature.shape[1] > self.obs_horizon:
+                map_feature = map_feature[:, -self.obs_horizon:]
+            feature = torch.cat(
+                (visual_feature, obs_seq["state"], map_feature), dim=-1
+            )
         elif self.use_map4d:
             if self.map4d_strict:
                 raise KeyError("use_map4d=True but obs_seq does not include map4d.")
@@ -624,7 +762,6 @@ class Agent(nn.Module):
                 (batch_size, self.obs_horizon, self.map4d_encoder.feature_dim),
                 device=visual_feature.device,
             )
-        if map_feature is not None:
             feature = torch.cat(
                 (visual_feature, obs_seq["state"], map_feature), dim=-1
             )
@@ -660,12 +797,34 @@ class Agent(nn.Module):
         )
 
         dp_loss = F.mse_loss(noise_pred, noise)
+        total_loss = dp_loss
+
         if self.use_map4d and self.map4d_losses is not None and map_aux is not None:
             map_losses = self.map4d_losses(map_aux)
             self.last_map_losses = map_losses
-            return dp_loss + map_losses["total"]
-        self.last_map_losses = None
-        return dp_loss
+            total_loss = total_loss + map_losses["total"]
+        else:
+            self.last_map_losses = None
+
+        # Auxiliary future prediction loss (raw_concat + aux_loss mode)
+        if self.map4d_aux_loss and "future_map4d" in obs_seq:
+            future_map4d = obs_seq["future_map4d"]  # (B, H, N, 12)
+            current_map4d = obs_seq["map4d"][:, -1]  # (B, N, 12)
+            # Position: predict delta (subtraction is valid for positions)
+            gt_future_pos = future_map4d[..., 3:6]  # (B, H, N, 3)
+            current_pos = current_map4d[:, :, 3:6].unsqueeze(1)  # (B, 1, N, 3)
+            gt_delta_pos = gt_future_pos - current_pos  # (B, H, N, 3)
+            # Rotation: predict absolute future rotation 6D (avoid delta subtraction bug)
+            gt_future_rot = future_map4d[..., 6:12]  # (B, H, N, 6)
+            gt_target = torch.cat([gt_delta_pos, gt_future_rot], dim=-1).flatten(start_dim=1)  # (B, H*N*9)
+            pred_future = self.future_pred_head(obs_cond)
+            aux_loss = F.l1_loss(pred_future, gt_target)
+            self.last_aux_loss = aux_loss
+            total_loss = total_loss + aux_loss * self.map4d_aux_weight
+        else:
+            self.last_aux_loss = None
+
+        return total_loss
 
     def get_action(self, obs_seq):
         # init scheduler
@@ -838,6 +997,7 @@ if __name__ == "__main__":
         map4d_source=args.map4d_source,
         map4d_task_name=args.map4d_task_name,
         map4d_future_horizon=args.map4d_future_horizon,
+        map4d_pre_horizon=args.map4d_pre_horizon,
         map4d_strict=args.map4d_strict,
     )
     sampler = RandomSampler(dataset, replacement=False)
@@ -873,6 +1033,11 @@ if __name__ == "__main__":
 
     best_eval_metrics = defaultdict(float)
     timings = defaultdict(float)
+    eval_metrics_path = os.path.abspath(
+        os.path.join(_REPO_ROOT, "outputs", "eval_metrics", f"{run_name}.jsonl")
+    )
+    os.makedirs(os.path.dirname(eval_metrics_path), exist_ok=True)
+    print(f"Eval metrics will be written to {eval_metrics_path}")
 
     # define evaluation and logging functions
     def evaluate_and_save_best(iteration):
@@ -889,6 +1054,16 @@ if __name__ == "__main__":
                 eval_metrics[k] = np.mean(eval_metrics[k])
                 writer.add_scalar(f"eval/{k}", eval_metrics[k], iteration)
                 print(f"{k}: {eval_metrics[k]:.4f}")
+
+            eval_record = {
+                "iteration": iteration,
+                "num_eval_episodes": args.num_eval_episodes,
+                "run_name": run_name,
+                **{k: float(v) for k, v in eval_metrics.items()},
+            }
+            with open(eval_metrics_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(eval_record, sort_keys=True) + "\n")
+            print(f"Eval metrics written to {eval_metrics_path}")
 
             save_on_best_metrics = ["success_once", "success_at_end"]
             for k in save_on_best_metrics:
@@ -910,7 +1085,6 @@ if __name__ == "__main__":
                 writer.add_scalar("losses/map4d_pose", map_losses["pose"].item(), iteration)
                 writer.add_scalar("losses/map4d_kinematic", map_losses["kinematic"].item(), iteration)
                 writer.add_scalar("losses/map4d_penetration", map_losses["penetration"].item(), iteration)
-                writer.add_scalar("losses/map4d_point_cloud", map_losses["point_cloud"].item(), iteration)
             for k, v in timings.items():
                 writer.add_scalar(f"time/{k}", v, iteration)
 

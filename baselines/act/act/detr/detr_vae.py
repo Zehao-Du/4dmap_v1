@@ -32,11 +32,14 @@ def get_sinusoid_encoding_table(n_position, d_hid):
 
 class DETRVAE(nn.Module):
     """ This is the DETR module that performs object detection """
-    def __init__(self, backbones, transformer, encoder, state_dim, action_dim, num_queries):
+    def __init__(self, backbones, transformer, encoder, state_dim, action_dim, num_queries,
+                 map4d_dim=0, map4d_token_dim=0, map4d_max_tokens=0):
         super().__init__()
         self.num_queries = num_queries
         self.transformer = transformer
         self.encoder = encoder
+        self.map4d_dim = map4d_dim
+        self.map4d_token_dim = map4d_token_dim
         hidden_dim = transformer.d_model
         self.action_head = nn.Linear(hidden_dim, action_dim)
         self.query_embed = nn.Embedding(num_queries, hidden_dim)
@@ -49,21 +52,49 @@ class DETRVAE(nn.Module):
             self.backbones = None
 
         # encoder extra parameters
-        self.latent_dim = 32 # size of latent z
-        self.cls_embed = nn.Embedding(1, hidden_dim) # extra cls token embedding
-        self.encoder_state_proj = nn.Linear(state_dim, hidden_dim)  # project state to embedding
-        self.encoder_action_proj = nn.Linear(action_dim, hidden_dim) # project action to embedding
-        self.latent_proj = nn.Linear(hidden_dim, self.latent_dim*2) # project hidden state to latent std, var
-        self.register_buffer('pos_table', get_sinusoid_encoding_table(1+1+num_queries, hidden_dim)) # [CLS], state, actions
+        self.latent_dim = 32
+        self.cls_embed = nn.Embedding(1, hidden_dim)
+        self.encoder_state_proj = nn.Linear(state_dim, hidden_dim)
+        self.encoder_action_proj = nn.Linear(action_dim, hidden_dim)
+        self.latent_proj = nn.Linear(hidden_dim, self.latent_dim*2)
+        self.register_buffer('pos_table', get_sinusoid_encoding_table(1+1+num_queries, hidden_dim))
+
+        if self.map4d_dim > 0:
+            self.input_proj_map4d = nn.Sequential(
+                nn.LayerNorm(self.map4d_dim),
+                nn.Linear(self.map4d_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, hidden_dim),
+            )
+        else:
+            self.input_proj_map4d = None
+
+        # map4d as tokens: project each (object, timestep) to a token
+        if self.map4d_token_dim > 0 and map4d_max_tokens > 0:
+            self.map4d_token_proj = nn.Sequential(
+                nn.Linear(map4d_token_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, hidden_dim),
+            )
+            self.map4d_token_pos = nn.Embedding(map4d_max_tokens, hidden_dim)
+        else:
+            self.map4d_token_proj = None
 
         # decoder extra parameters
-        self.latent_out_proj = nn.Linear(self.latent_dim, hidden_dim) # project latent sample to embedding
-        self.additional_pos_embed = nn.Embedding(2, hidden_dim) # learned position embedding for state and proprio
+        self.latent_out_proj = nn.Linear(self.latent_dim, hidden_dim)
+        num_additional_tokens = 3 if self.input_proj_map4d is not None else 2
+        self.additional_pos_embed = nn.Embedding(num_additional_tokens, hidden_dim) # latent, proprio, optional map4d
 
     def forward(self, obs, actions=None):
         is_training = actions is not None
         state = obs['state'] if self.backbones is not None else obs
         bs = state.shape[0]
+        map4d_input = None
+        if self.input_proj_map4d is not None:
+            map4d_feature = obs.get('map4d_feature')
+            if map4d_feature is None:
+                raise ValueError("map4d_feature is required when DETRVAE is initialized with map4d_dim > 0")
+            map4d_input = self.input_proj_map4d(map4d_feature)
 
         if is_training:
             # project CLS token, state sequence, and action sequence to embedding dim
@@ -115,13 +146,48 @@ class DETRVAE(nn.Module):
             # fold camera dimension into width dimension
             src = torch.cat(all_cam_features, axis=3) # (batch, hidden_dim, 4, 8)
             pos = torch.cat(all_cam_pos, axis=3) # (batch, hidden_dim, 4, 8)
-            hs = self.transformer(src, None, self.query_embed.weight, pos, latent_input, proprio_input, self.additional_pos_embed.weight)[0] # (batch, num_queries, hidden_dim)
+
+            # map4d as tokens: project and append to src
+            map4d_tokens_seq = None
+            map4d_tokens_pos = None
+            if self.map4d_token_proj is not None and 'map4d_tokens' in obs:
+                raw_tokens = obs['map4d_tokens']  # (batch, T*N, token_dim)
+                map4d_tokens_seq = self.map4d_token_proj(raw_tokens)  # (batch, T*N, hidden_dim)
+                num_tokens = map4d_tokens_seq.shape[1]
+                token_idx = torch.arange(num_tokens, device=state.device)
+                map4d_tokens_pos = self.map4d_token_pos(token_idx)  # (T*N, hidden_dim)
+                map4d_tokens_pos = map4d_tokens_pos.unsqueeze(0).expand(bs, -1, -1)  # (batch, T*N, hidden_dim)
+
+            hs, memory = self.transformer(
+                src,
+                None,
+                self.query_embed.weight,
+                pos,
+                latent_input,
+                proprio_input,
+                map4d_input,
+                self.additional_pos_embed.weight,
+                map4d_tokens_seq=map4d_tokens_seq,
+                map4d_tokens_pos=map4d_tokens_pos,
+            )
+            hs = hs[0]  # (batch, num_queries, hidden_dim)
         else:
             state = self.input_proj_robot_state(state)
-            hs = self.transformer(None, None, self.query_embed.weight, None, latent_input, state, self.additional_pos_embed.weight)[0]
+            hs, memory = self.transformer(
+                None,
+                None,
+                self.query_embed.weight,
+                None,
+                latent_input,
+                state,
+                map4d_input,
+                self.additional_pos_embed.weight,
+            )
+            hs = hs[0]
 
+        # memory shape: (seq_len, batch, hidden_dim)
         a_hat = self.action_head(hs)
-        return a_hat, [mu, logvar]
+        return a_hat, [mu, logvar], memory
 
 
 def build_encoder(args):

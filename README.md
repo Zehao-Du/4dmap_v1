@@ -91,6 +91,14 @@ tail -f "${LOG_FILE}"
 
 The config uses ```--use-map4d```, ```--map4d-source maniskill_gt```, ```--obs-mode rgb+depth```, and ```--num-demos 100```. Wandb upload is disabled by default through ```--no-track```; set ```WANDB_MODE=offline``` if you later enable tracking.
 
+Eval metrics are written both to TensorBoard and to a plain JSONL file for AI-platform runs without TensorBoard access:
+
+```bash
+tail -f outputs/eval_metrics/stackcube_map4d_gt_dp_50k_seed1.jsonl
+```
+
+The main success-rate fields are ```success_once``` and ```success_at_end```.
+
 Smoke test:
 
 ```bash
