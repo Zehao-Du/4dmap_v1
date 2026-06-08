@@ -3,10 +3,10 @@
 # Only keeps trajectories <= 400 steps (filters out long retry trajectories)
 # Reference: 4dmap_policy/README.md
 set -e
-ROOT_DIR=/inspire/hdd/project/robot-dna/baojiachun-CZXS25130063/zehao/4dmap
+ROOT_DIR=/data2/zehao/MAP4D
 DATASET_DIR="$ROOT_DIR/dataset/ManiSkill/PlugCharger-v1/motionplanning"
 RECORD_DIR="$ROOT_DIR/dataset/ManiSkill"
-POLICY_DIR="$ROOT_DIR/4dmap_policy"
+POLICY_DIR="$ROOT_DIR/4dmap_v1"
 
 echo "Cleaning old data in $DATASET_DIR ..."
 rm -f "$DATASET_DIR"/PlugCharger*.h5 "$DATASET_DIR"/PlugCharger*.json

@@ -1,0 +1,34 @@
+name: StackCube-v1
+dataset_task_name: stackcube
+num_objects: 3
+robot_state_dim: 32
+map4d_dim: 9
+size_parameter_dim: 9
+relation_parameter_dim: 0
+
+dataset:
+  _target_: map4d.backbone.dataset.maniskill_map4d_dataset.ManiSkillMap4DDataset
+  demo_path: ${oc.env:MAP4D_DEMO_PATH,null}
+  keyframe_sidecar_path: ${oc.env:MAP4D_KEYFRAME_SIDECAR_PATH,null}
+  task_name: ${task.name}
+  actor_names: null
+  horizon_action: ${horizon_action}
+  horizon_keyframe: ${horizon_keyframe}
+  n_obs_steps: ${n_obs_steps}
+  num_objects: ${task.num_objects}
+  robot_state_dim: ${task.robot_state_dim}
+  map4d_dim: ${task.map4d_dim}
+  size_parameter_dim: ${task.size_parameter_dim}
+  relation_parameter_dim: ${task.relation_parameter_dim}
+  use_rgb: ${policy.model_cfg.use_rgb}
+  use_depth: false
+  rgb_feature_dim: ${policy.model_cfg.rgb_feature_dim}
+  allow_missing_rgb_feature: false
+  allow_raw_rgb_stats_feature: false
+  num_traj: ${oc.env:MAP4D_NUM_TRAJ,null}
+  val_ratio: 0.05
+  seed: ${seed}
+  synthetic: ${training.debug}
+  synthetic_episodes: 4
+  synthetic_length: 32
+  strict_target_format: true

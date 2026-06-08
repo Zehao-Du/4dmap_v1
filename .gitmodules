@@ -10,3 +10,6 @@
 [submodule "map4d/construction/GroundedSam/Grounded-SAM-2"]
 	path = map4d/construction/GroundedSam/Grounded-SAM-2
 	url = https://github.com/IDEA-Research/Grounded-SAM-2.git
+[submodule "map4d/backbone/model/vision/dinov3"]
+	path = map4d/backbone/model/vision/dinov3
+	url = org-16943930@github.com:facebookresearch/dinov3.git

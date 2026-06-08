@@ -1,0 +1,128 @@
+defaults:
+  - _self_
+  - task: stackcube_map4d_dit
+
+name: train_map4d_dit
+alg_name: map4d_dit
+addition_info: debug
+seed: 0
+wandb_name: Map4D_Backbone
+
+task_name: ${task.name}
+exp_name: ${name}_${task_name}_${addition_info}
+ckpt_dir: exp_logs/map4d_dit
+run_dir: ${ckpt_dir}/${task.dataset_task_name}/${exp_name}_seed${seed}
+
+horizon_action: 50
+horizon_keyframe: 4
+n_obs_steps: 2
+n_action_steps: 50
+num_objects: ${task.num_objects}
+robot_state_dim: ${task.robot_state_dim}
+
+policy:
+  _target_: map4d.backbone.policy.map4d_dit_policy.Map4DDiTPolicy
+  action_horizon: ${horizon_action}
+  keyframe_horizon: ${horizon_keyframe}
+  n_action_steps: ${n_action_steps}
+  n_obs_steps: ${n_obs_steps}
+  trajectory_loss_weight: 1.0
+  keyframe_tcp_loss_weight: 1.0
+  keyframe_object_loss_weight: 0.3
+  gripper_loss_weight: 1.0
+  noise_scheduler_cfg:
+    num_train_timesteps: 1000
+    prediction_type: epsilon
+    position_beta_schedule: scaled_linear
+    rotation_beta_schedule: squaredcos_cap_v2
+  num_inference_steps: 1000
+  model_cfg:
+    robot_state_dim: ${robot_state_dim}
+    num_objects: ${num_objects}
+    map4d_dim: ${task.map4d_dim}
+    size_parameter_dim: ${task.size_parameter_dim}
+    relation_parameter_dim: ${task.relation_parameter_dim}
+    rgb_feature_dim: 288
+    embed_dim: 288
+    depth: 8
+    num_heads: 8
+    mlp_ratio: 4.0
+    dropout: 0.0
+    diffusion_step_embed_dim: 288
+    use_rgb: true
+    max_context_tokens: 1024
+
+ema:
+  _target_: map4d.backbone.model.diffusion.ema_model.EMAModel
+  update_after_step: 0
+  inv_gamma: 1.0
+  power: 0.75
+  min_value: 0.0
+  max_value: 0.9999
+
+dataloader:
+  batch_size: 128
+  num_workers: 4
+  shuffle: true
+  pin_memory: true
+  persistent_workers: false
+
+val_dataloader:
+  batch_size: 128
+  num_workers: 4
+  shuffle: false
+  pin_memory: true
+  persistent_workers: false
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 1.0e-4
+  betas: [0.95, 0.999]
+  eps: 1.0e-8
+  weight_decay: 1.0e-6
+
+training:
+  device: cuda
+  seed: ${seed}
+  debug: false
+  resume: false
+  lr_scheduler: cosine
+  lr_warmup_steps: 500
+  num_epochs: 2000
+  gradient_accumulate_every: 1
+  use_ema: true
+  checkpoint_every: 50
+  val_every: 50
+  sample_every: 20
+  max_train_steps: null
+  max_val_steps: null
+  tqdm_interval_sec: 0.01
+
+logging:
+  group: ${exp_name}
+  id: null
+  mode: disabled
+  name: ${addition_info}
+  project: ${wandb_name}
+  resume: true
+  tags:
+    - ${wandb_name}
+
+checkpoint:
+  save_ckpt: true
+  topk:
+    monitor_key: val_loss
+    mode: min
+    k: 1
+    format_str: epoch={epoch:04d}-val_loss={val_loss:.7f}.pth.tar
+  save_last_ckpt: true
+  save_last_snapshot: false
+
+hydra:
+  job:
+    override_dirname: ${name}
+  run:
+    dir: ${run_dir}
+  sweep:
+    dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+    subdir: ${hydra.job.num}

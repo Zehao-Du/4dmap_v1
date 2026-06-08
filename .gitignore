@@ -1,6 +1,5 @@
 # dataset
 data/
-dataset/
 outputs/
 runs/
 
@@ -36,9 +35,9 @@ core.*
 # OS files
 .DS_Store
 
-# docs (generated)
-docs/
-
 # misc legacy
 run_dp_then_smaller_than_4_matrix.sh
 smaller_than_4_matrix.py
+
+# codex/claude
+AGENTS.md

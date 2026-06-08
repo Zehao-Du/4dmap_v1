@@ -88,10 +88,11 @@ class Backbone(BackboneBase):
                  train_backbone: bool,
                  return_interm_layers: bool,
                  dilation: bool,
-                 include_depth: bool):
+                 include_depth: bool,
+                 pretrained: bool = True):
         backbone = getattr(torchvision.models, name)(
             replace_stride_with_dilation=[False, False, dilation],
-            pretrained=is_main_process(), norm_layer=FrozenBatchNorm2d) # pretrained # TODO do we want frozen batch_norm??
+            pretrained=pretrained and is_main_process(), norm_layer=FrozenBatchNorm2d) # pretrained # TODO do we want frozen batch_norm??
 
         # for rgbd data 
         if include_depth:
@@ -123,7 +124,14 @@ def build_backbone(args):
     position_embedding = build_position_encoding(args)
     train_backbone = args.lr_backbone > 0
     return_interm_layers = args.masks
-    backbone = Backbone(args.backbone, train_backbone, return_interm_layers, args.dilation, args.include_depth)
+    backbone = Backbone(
+        args.backbone,
+        train_backbone,
+        return_interm_layers,
+        args.dilation,
+        args.include_depth,
+        pretrained=getattr(args, "backbone_pretrained", True),
+    )
     model = Joiner(backbone, position_embedding)
     model.num_channels = backbone.num_channels
     return model

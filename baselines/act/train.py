@@ -420,7 +420,7 @@ if __name__ == "__main__":
         timings["update"] += time.time() - last_tick
 
         # Evaluation
-        if cur_iter % args.eval_freq == 0:
+        if cur_iter > 0 and cur_iter % args.eval_freq == 0:
             last_tick = time.time()
 
             ema.copy_to(ema_agent.parameters())
