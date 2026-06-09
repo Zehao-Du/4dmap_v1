@@ -105,7 +105,14 @@ class Map4DDiTPolicy(BasePolicy):
 
         keyframe_tcp = batch["keyframe"]["tcp"].clone()
         keyframe_tcp[..., 0:3] = self._normalize("keyframe_tcp_pos", keyframe_tcp[..., 0:3])
-        keyframe_tcp[..., 3:7] = normalize_quaternion(keyframe_tcp[..., 3:7])
+        if keyframe_tcp.shape[-1] == 7:
+            keyframe_tcp[..., 3:7] = normalize_quaternion(keyframe_tcp[..., 3:7])
+        elif keyframe_tcp.shape[-1] == 4:
+            keyframe_tcp[..., 3:4] = self._normalize(
+                "keyframe_tcp_gripper", keyframe_tcp[..., 3:4]
+            )
+        else:
+            raise ValueError(f"Unsupported keyframe TCP dim {keyframe_tcp.shape[-1]}")
 
         gripper = batch["action"]["gripper_openness"].clone()
         gripper = self._normalize("gripper_openness", gripper)
@@ -159,19 +166,22 @@ class Map4DDiTPolicy(BasePolicy):
             ],
             dim=-1,
         )
-        noisy_tcp = torch.cat(
-            [
-                self.position_noise_scheduler.add_noise(
-                    keyframe_tcp[..., 0:3], noise["keyframe_tcp"][..., 0:3], timesteps
-                ),
-                normalize_quaternion(
-                    self.rotation_noise_scheduler.add_noise(
-                        keyframe_tcp[..., 3:7], noise["keyframe_tcp"][..., 3:7], timesteps
-                    )
-                ),
-            ],
-            dim=-1,
+        tcp_pos = self.position_noise_scheduler.add_noise(
+            keyframe_tcp[..., 0:3], noise["keyframe_tcp"][..., 0:3], timesteps
         )
+        if keyframe_tcp.shape[-1] == 7:
+            tcp_tail = normalize_quaternion(
+                self.rotation_noise_scheduler.add_noise(
+                    keyframe_tcp[..., 3:7], noise["keyframe_tcp"][..., 3:7], timesteps
+                )
+            )
+        elif keyframe_tcp.shape[-1] == 4:
+            tcp_tail = self.position_noise_scheduler.add_noise(
+                keyframe_tcp[..., 3:4], noise["keyframe_tcp"][..., 3:4], timesteps
+            )
+        else:
+            raise ValueError(f"Unsupported keyframe TCP dim {keyframe_tcp.shape[-1]}")
+        noisy_tcp = torch.cat([tcp_pos, tcp_tail], dim=-1)
         noisy = {
             "trajectory": noisy_trajectory,
             "keyframe_object": noisy_object,
@@ -227,13 +237,22 @@ class Map4DDiTPolicy(BasePolicy):
         tcp_pos = self.position_noise_scheduler.step(
             pred["keyframe_tcp"][..., 0:3], t, sample["keyframe_tcp"][..., 0:3]
         ).prev_sample
-        tcp_quat = self.rotation_noise_scheduler.step(
-            pred["keyframe_tcp"][..., 3:7], t, sample["keyframe_tcp"][..., 3:7]
-        ).prev_sample
+        if sample["keyframe_tcp"].shape[-1] == 7:
+            tcp_tail = normalize_quaternion(
+                self.rotation_noise_scheduler.step(
+                    pred["keyframe_tcp"][..., 3:7], t, sample["keyframe_tcp"][..., 3:7]
+                ).prev_sample
+            )
+        elif sample["keyframe_tcp"].shape[-1] == 4:
+            tcp_tail = self.position_noise_scheduler.step(
+                pred["keyframe_tcp"][..., 3:4], t, sample["keyframe_tcp"][..., 3:4]
+            ).prev_sample
+        else:
+            raise ValueError(f"Unsupported keyframe TCP dim {sample['keyframe_tcp'].shape[-1]}")
         return {
             "trajectory": torch.cat([trajectory_pos, normalize_quaternion(trajectory_quat)], dim=-1),
             "keyframe_object": torch.cat([object_pos, object_rot], dim=-1),
-            "keyframe_tcp": torch.cat([tcp_pos, normalize_quaternion(tcp_quat)], dim=-1),
+            "keyframe_tcp": torch.cat([tcp_pos, tcp_tail], dim=-1),
         }
 
     @torch.no_grad()
@@ -257,11 +276,16 @@ class Map4DDiTPolicy(BasePolicy):
                 dtype=dtype,
             ),
             "keyframe_tcp": torch.randn(
-                batch_size, self.keyframe_horizon, 7, device=device, dtype=dtype
+                batch_size,
+                self.keyframe_horizon,
+                self.model.tcp_dim,
+                device=device,
+                dtype=dtype,
             ),
         }
         sample["trajectory"][..., 3:7] = normalize_quaternion(sample["trajectory"][..., 3:7])
-        sample["keyframe_tcp"][..., 3:7] = normalize_quaternion(sample["keyframe_tcp"][..., 3:7])
+        if self.model.tcp_dim == 7:
+            sample["keyframe_tcp"][..., 3:7] = normalize_quaternion(sample["keyframe_tcp"][..., 3:7])
 
         self.position_noise_scheduler.set_timesteps(self.num_inference_steps)
         self.rotation_noise_scheduler.set_timesteps(self.num_inference_steps)

@@ -43,7 +43,7 @@ uv pip install diffusers
 uv pip install lerobot
 
 # others
-uv pip install wandb kornia omegaconf psutil tqdm warp-lang
+uv pip install wandb kornia omegaconf hydra-core "zarr<3" psutil tqdm warp-lang
 
 ### benchmark
 # maniskill
@@ -99,7 +99,7 @@ uv pip install diffusers
 uv pip install lerobot
 
 # others
-uv pip install wandb kornia omegaconf psutil tqdm warp-lang
+uv pip install wandb kornia omegaconf hydra-core "zarr<3" psutil tqdm warp-lang
 
 ### benchmark
 # maniskill

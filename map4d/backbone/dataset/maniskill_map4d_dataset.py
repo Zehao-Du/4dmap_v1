@@ -16,6 +16,7 @@ except ModuleNotFoundError:  # synthetic smoke tests do not require HDF5 support
 
 from helper.keyframe_targets import (
     MAP4D_DIT_TARGET_FORMAT,
+    MAP4D_DIT_TCP_POS_GRIPPER_TARGET_FORMAT,
     build_future_keyframe_table,
     canonicalize_quaternion_np,
     gather_map4d_dit_keyframe_targets,
@@ -199,6 +200,7 @@ class ManiSkillMap4DDataset(BaseDataset):
         use_rgb: bool = True,
         use_depth: bool = False,
         rgb_feature_dim: int = 288,
+        keyframe_tcp_dim: Optional[int] = None,
         allow_missing_rgb_feature: bool = False,
         allow_raw_rgb_stats_feature: bool = False,
         num_traj: Optional[int] = None,
@@ -225,6 +227,7 @@ class ManiSkillMap4DDataset(BaseDataset):
         self.use_rgb = bool(use_rgb)
         self.use_depth = bool(use_depth)
         self.rgb_feature_dim = int(rgb_feature_dim)
+        self.keyframe_tcp_dim = None if keyframe_tcp_dim is None else int(keyframe_tcp_dim)
         self.allow_missing_rgb_feature = bool(allow_missing_rgb_feature)
         self.allow_raw_rgb_stats_feature = bool(allow_raw_rgb_stats_feature)
         self.strict_target_format = bool(strict_target_format)
@@ -277,8 +280,12 @@ class ManiSkillMap4DDataset(BaseDataset):
                 scale=0.05, size=(length + 1, self.horizon_keyframe, self.num_objects, 9)
             ).astype(np.float32)
             object_targets[..., 3:9] = identity_rot6d
-            tcp_targets = rng.normal(scale=0.05, size=(length + 1, self.horizon_keyframe, 7)).astype(np.float32)
-            tcp_targets[..., 3:7] = identity_quat
+            tcp_dim = self.keyframe_tcp_dim or 7
+            tcp_targets = rng.normal(
+                scale=0.05, size=(length + 1, self.horizon_keyframe, tcp_dim)
+            ).astype(np.float32)
+            if tcp_dim == 7:
+                tcp_targets[..., 3:7] = identity_quat
             record = {
                 "robot_state": robot_state,
                 "actions": actions,
@@ -444,10 +451,14 @@ class ManiSkillMap4DDataset(BaseDataset):
             target_format = f.attrs.get("target_format", "")
             if isinstance(target_format, bytes):
                 target_format = target_format.decode("utf-8")
-            if self.strict_target_format and target_format != MAP4D_DIT_TARGET_FORMAT:
+            compatible_formats = {
+                MAP4D_DIT_TARGET_FORMAT,
+                MAP4D_DIT_TCP_POS_GRIPPER_TARGET_FORMAT,
+            }
+            if self.strict_target_format and target_format not in compatible_formats:
                 raise ValueError(
                     f"Keyframe sidecar target_format={target_format!r} is not compatible with "
-                    f"{MAP4D_DIT_TARGET_FORMAT}."
+                    f"{sorted(compatible_formats)}."
                 )
             for traj_name in traj_names:
                 if traj_name not in f:
@@ -526,6 +537,11 @@ class ManiSkillMap4DDataset(BaseDataset):
                         keyframe_object, keyframe_tcp = gather_map4d_dit_keyframe_targets(
                             map4d, tcp_pose, future_table
                         )
+                if self.keyframe_tcp_dim is not None and keyframe_tcp.shape[-1] != self.keyframe_tcp_dim:
+                    raise ValueError(
+                        f"{traj_name}: expected keyframe_tcp_dim={self.keyframe_tcp_dim}, "
+                        f"got {keyframe_tcp.shape[-1]}"
+                    )
                 record = {
                     "robot_state": robot_state,
                     "actions": actions,
@@ -592,6 +608,11 @@ class ManiSkillMap4DDataset(BaseDataset):
             "keyframe_object_pos": keyframe_object_pos,
             "keyframe_tcp_pos": keyframe_tcp_pos,
         }
+        if self.trajectories[0]["keyframe_tcp"].shape[-1] == 4:
+            fields["keyframe_tcp_gripper"] = np.concatenate(
+                [traj["keyframe_tcp"][..., 3:4].reshape(-1, 1) for traj in self.trajectories],
+                axis=0,
+            )
         if self.relation_parameter_dim > 0:
             fields["relation_parameters"] = np.stack(
                 [traj["relation_parameters"] for traj in self.trajectories],

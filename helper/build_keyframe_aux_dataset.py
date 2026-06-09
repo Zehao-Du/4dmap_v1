@@ -32,17 +32,21 @@ try:
     from helper.extract_keyframes import extract_traj_keyframes
     from helper.keyframe_targets import (
         MAP4D_DIT_TARGET_FORMAT,
+        MAP4D_DIT_TCP_POS_GRIPPER_TARGET_FORMAT,
         build_future_keyframe_table,
         gather_keyframe_targets,
         gather_map4d_dit_keyframe_targets,
+        gather_map4d_dit_pos_gripper_keyframe_targets,
     )
 except ModuleNotFoundError:
     from extract_keyframes import extract_traj_keyframes  # type: ignore
     from keyframe_targets import (  # type: ignore
         MAP4D_DIT_TARGET_FORMAT,
+        MAP4D_DIT_TCP_POS_GRIPPER_TARGET_FORMAT,
         build_future_keyframe_table,
         gather_keyframe_targets,
         gather_map4d_dit_keyframe_targets,
+        gather_map4d_dit_pos_gripper_keyframe_targets,
     )
 
 
@@ -250,6 +254,22 @@ def _write_dataset(group: h5py.Group, name: str, value: np.ndarray) -> None:
     group.create_dataset(name, data=arr, **kwargs)
 
 
+def _load_gripper_target(traj: h5py.Group, length: int) -> np.ndarray:
+    if "actions" in traj:
+        actions = np.asarray(traj["actions"][()], dtype=np.float32)
+        if actions.ndim == 2 and actions.shape[0] == length - 1 and actions.shape[1] >= 1:
+            gripper = actions[:, -1:]
+            return np.concatenate([gripper[:1], gripper], axis=0).astype(np.float32)
+
+    qpos = traj.get("obs", {}).get("agent", {}).get("qpos") if "obs" in traj else None
+    if isinstance(qpos, h5py.Dataset):
+        qpos_arr = np.asarray(qpos[()], dtype=np.float32)
+        if qpos_arr.ndim == 2 and qpos_arr.shape[0] == length and qpos_arr.shape[1] >= 2:
+            return qpos_arr[:, -2:].mean(axis=1, keepdims=True).astype(np.float32)
+
+    return np.zeros((length, 1), dtype=np.float32)
+
+
 def build_keyframe_aux_dataset(
     demo_path: str,
     output_path: str,
@@ -292,29 +312,36 @@ def build_keyframe_aux_dataset(
         f_out.attrs["task_name"] = task_name
         f_out.attrs["actor_names"] = json.dumps(list(actor_names))
         f_out.attrs["future_horizon"] = int(future_horizon)
-        if tcp_target not in {"pose", "pos"}:
-            raise ValueError(f"tcp_target must be 'pose' or 'pos', got {tcp_target!r}")
+        if tcp_target not in {"pose", "pos", "pos_gripper"}:
+            raise ValueError(f"tcp_target must be 'pose', 'pos', or 'pos_gripper', got {tcp_target!r}")
         if target_format is None:
-            target_format = (
-                "object_delta_pos_rot6d_plus_tcp_pose"
-                if tcp_target == "pose"
-                else "object_delta_pos_rot6d_plus_tcp_pos"
-            )
+            if tcp_target == "pose":
+                target_format = "object_delta_pos_rot6d_plus_tcp_pose"
+            elif tcp_target == "pos":
+                target_format = "object_delta_pos_rot6d_plus_tcp_pos"
+            else:
+                target_format = "object_delta_pos_rot6d_plus_tcp_pos_gripper"
         if target_format not in {
             MAP4D_DIT_TARGET_FORMAT,
+            MAP4D_DIT_TCP_POS_GRIPPER_TARGET_FORMAT,
             "object_delta_pos_rot6d_plus_tcp_pose",
             "object_delta_pos_rot6d_plus_tcp_pos",
+            "object_delta_pos_rot6d_plus_tcp_pos_gripper",
         }:
             raise ValueError(f"Unsupported target_format={target_format!r}")
         if target_format == MAP4D_DIT_TARGET_FORMAT and tcp_target != "pose":
             raise ValueError(f"{MAP4D_DIT_TARGET_FORMAT} requires tcp_target='pose'")
+        if target_format == MAP4D_DIT_TCP_POS_GRIPPER_TARGET_FORMAT and tcp_target != "pos_gripper":
+            raise ValueError(
+                f"{MAP4D_DIT_TCP_POS_GRIPPER_TARGET_FORMAT} requires tcp_target='pos_gripper'"
+            )
         f_out.attrs["tcp_target"] = tcp_target
-        f_out.attrs["tcp_dim"] = 7 if tcp_target == "pose" else 3
+        f_out.attrs["tcp_dim"] = 7 if tcp_target == "pose" else 4 if tcp_target == "pos_gripper" else 3
         f_out.attrs["target_format"] = target_format
 
         for traj_name in traj_names:
             traj = f_in[traj_name]
-            if target_format == MAP4D_DIT_TARGET_FORMAT:
+            if target_format in {MAP4D_DIT_TARGET_FORMAT, MAP4D_DIT_TCP_POS_GRIPPER_TARGET_FORMAT}:
                 map4d = _load_pose_map4d_from_traj(traj, actor_names)
                 size_parameters, relation_parameters = _task_parameters(task_name)
                 group_map4d_dim = 9
@@ -327,7 +354,13 @@ def build_keyframe_aux_dataset(
                 raise ValueError(
                     f"{traj_name}: tcp_pose length {tcp_pose.shape[0]} != map4d length {map4d.shape[0]}"
                 )
-            tcp_target_seq = tcp_pose if tcp_target == "pose" else tcp_pose[:, :3]
+            gripper_target = _load_gripper_target(traj, map4d.shape[0])
+            if tcp_target == "pose":
+                tcp_target_seq = tcp_pose
+            elif tcp_target == "pos":
+                tcp_target_seq = tcp_pose[:, :3]
+            else:
+                tcp_target_seq = np.concatenate([tcp_pose[:, :3], gripper_target], axis=-1)
 
             keyframe_data = extract_traj_keyframes(
                 traj,
@@ -354,6 +387,9 @@ def build_keyframe_aux_dataset(
             _write_dataset(group, "tcp_pose", tcp_pose)
             if tcp_target == "pos":
                 _write_dataset(group, "tcp_pos", tcp_target_seq)
+            elif tcp_target == "pos_gripper":
+                _write_dataset(group, "tcp_pos_gripper", tcp_target_seq)
+                _write_dataset(group, "gripper_target", gripper_target)
             _write_dataset(group, "keyframe_indices", keyframes)
             _write_dataset(group, "keyframe_tcp_pose", tcp_target_seq[keyframes])
             _write_dataset(group, "future_keyframe_indices", future_table)
@@ -363,6 +399,13 @@ def build_keyframe_aux_dataset(
                     object_targets, tcp_targets = gather_map4d_dit_keyframe_targets(
                         map4d,
                         tcp_pose,
+                        future_table,
+                    )
+                elif target_format == MAP4D_DIT_TCP_POS_GRIPPER_TARGET_FORMAT:
+                    object_targets, tcp_targets = gather_map4d_dit_pos_gripper_keyframe_targets(
+                        map4d,
+                        tcp_pose,
+                        gripper_target,
                         future_table,
                     )
                 else:
@@ -393,8 +436,10 @@ def build_keyframe_aux_dataset(
         "future_horizon": future_horizon,
         "tcp_target": tcp_target,
         "target_format": target_format,
-        "tcp_dim": 7 if tcp_target == "pose" else 3,
-        "map4d_dim": 9 if target_format == MAP4D_DIT_TARGET_FORMAT else 12,
+        "tcp_dim": 7 if tcp_target == "pose" else 4 if tcp_target == "pos_gripper" else 3,
+        "map4d_dim": 9
+        if target_format in {MAP4D_DIT_TARGET_FORMAT, MAP4D_DIT_TCP_POS_GRIPPER_TARGET_FORMAT}
+        else 12,
         "size_parameter_dim": int(_task_parameters(task_name)[0].shape[0]),
         "relation_parameter_dim": int(_task_parameters(task_name)[1].shape[0]),
         "materialize_targets": materialize_targets,
@@ -420,17 +465,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-separation", type=int, default=1)
     parser.add_argument(
         "--tcp-target",
-        choices=["pose", "pos"],
+        choices=["pose", "pos", "pos_gripper"],
         default="pose",
-        help="Use full TCP pose (7D) or TCP position only (3D) for future keyframe targets.",
+        help=(
+            "Use full TCP pose (7D), TCP position only (3D), or "
+            "TCP position plus gripper (4D) for future keyframe targets."
+        ),
     )
     parser.add_argument(
         "--target-format",
         default=None,
         choices=[
             MAP4D_DIT_TARGET_FORMAT,
+            MAP4D_DIT_TCP_POS_GRIPPER_TARGET_FORMAT,
             "object_delta_pos_rot6d_plus_tcp_pose",
             "object_delta_pos_rot6d_plus_tcp_pos",
+            "object_delta_pos_rot6d_plus_tcp_pos_gripper",
         ],
         help=(
             "Materialized keyframe target convention. Defaults to the legacy "

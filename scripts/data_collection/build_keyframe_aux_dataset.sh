@@ -51,18 +51,20 @@ case "${CONTROL_MODE}" in
 esac
 
 case "${TCP_TARGET}" in
-  pose|pos)
+  pose|pos|pos_gripper)
     ;;
   *)
-    echo "Unsupported TCP_TARGET=${TCP_TARGET}. Use pose or pos." >&2
+    echo "Unsupported TCP_TARGET=${TCP_TARGET}. Use pose, pos, or pos_gripper." >&2
     exit 1
     ;;
 esac
 
 if [[ "${TCP_TARGET}" == "pose" ]]; then
   TARGET_FORMAT="object_delta_pos_rot6d_plus_tcp_pose"
-else
+elif [[ "${TCP_TARGET}" == "pos" ]]; then
   TARGET_FORMAT="object_delta_pos_rot6d_plus_tcp_pos"
+else
+  TARGET_FORMAT="object_delta_pos_rot6d_plus_tcp_pos_gripper"
 fi
 
 if [[ $# -ge 1 ]]; then
@@ -96,6 +98,8 @@ if [[ $# -ge 2 ]]; then
   OUTPUT_PATH="$2"
 elif [[ "${TCP_TARGET}" == "pose" ]]; then
   OUTPUT_PATH="${DEMO_PATH%.h5}.keyframe_aux_h${FUTURE_HORIZON}.h5"
+elif [[ "${TCP_TARGET}" == "pos_gripper" ]]; then
+  OUTPUT_PATH="${DEMO_PATH%.h5}.keyframe_aux_tcp_pos_gripper_h${FUTURE_HORIZON}.h5"
 else
   OUTPUT_PATH="${DEMO_PATH%.h5}.keyframe_aux_tcp_pos_h${FUTURE_HORIZON}.h5"
 fi

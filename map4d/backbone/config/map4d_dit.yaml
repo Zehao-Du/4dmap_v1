@@ -42,6 +42,7 @@ policy:
     map4d_dim: ${task.map4d_dim}
     size_parameter_dim: ${task.size_parameter_dim}
     relation_parameter_dim: ${task.relation_parameter_dim}
+    tcp_dim: ${task.keyframe_tcp_dim}
     rgb_feature_dim: 288
     embed_dim: 288
     depth: 8
@@ -97,6 +98,23 @@ training:
   max_train_steps: null
   max_val_steps: null
   tqdm_interval_sec: 0.01
+
+rollout:
+  enabled: true
+  every: 100
+  num_eval_episodes: 100
+  num_eval_envs: 10
+  sim_backend: physx_cuda
+  obs_mode: rgb
+  control_mode: ${task.eval_control_mode}
+  max_episode_steps: ${task.eval_max_episode_steps}
+  action_mode: ${task.eval_action_mode}
+  use_rgb: ${policy.model_cfg.use_rgb}
+  camera_names: [base_camera, hand_camera]
+  image_size: 224
+  dinov3_model: dinov3_vits16
+  dinov3_weights_path: /data2/zehao/models/DINOv3/DINOv3_ViT_LVD_1689M/dinov3_vits16_pretrain_lvd1689m-08c60483.pth
+  dinov3_third_party_dir: /data2/zehao/MAP4D/4dmap_v1/map4d/backbone/model/vision/dinov3
 
 logging:
   group: ${exp_name}

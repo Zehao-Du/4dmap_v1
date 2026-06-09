@@ -32,6 +32,16 @@ def _load_backbone(third_party_dir: str, weights_path: str, model: str):
     }
     if model not in builders:
         raise ValueError(f"Unsupported DINOv3 model {model!r}; choose from {list(builders)}")
+    if weights_path and Path(weights_path).expanduser().exists():
+        backbone = builders[model](pretrained=False)
+        try:
+            state_dict = torch.load(weights_path, map_location="cpu", weights_only=True)
+        except TypeError:
+            state_dict = torch.load(weights_path, map_location="cpu")
+        if isinstance(state_dict, dict) and "state_dict" in state_dict:
+            state_dict = state_dict["state_dict"]
+        backbone.load_state_dict(state_dict, strict=True)
+        return backbone
     return builders[model](pretrained=True, weights=weights_path)
 
 

@@ -15,8 +15,23 @@ mkdir -p "$DATASET_DIR"
 TARGET_DEMOS=${1:-1000}
 MAX_STEPS=400
 NUM_PROCS=${2:-10}
+IMAGE_SIZE=${3:-}
 # Collect extra to account for filtering (empirically ~65% pass the filter)
 COLLECT_N=$(( TARGET_DEMOS * 2 ))
+REPLAY_CAMERA_ARGS=()
+if [[ -n "$IMAGE_SIZE" && "$IMAGE_SIZE" != "native" ]]; then
+  if [[ "$IMAGE_SIZE" =~ ^[0-9]+$ ]]; then
+    CAMERA_WIDTH="$IMAGE_SIZE"
+    CAMERA_HEIGHT="$IMAGE_SIZE"
+  elif [[ "$IMAGE_SIZE" =~ ^[0-9]+x[0-9]+$ ]]; then
+    CAMERA_WIDTH="${IMAGE_SIZE%x*}"
+    CAMERA_HEIGHT="${IMAGE_SIZE#*x}"
+  else
+    echo "Invalid IMAGE_SIZE=$IMAGE_SIZE. Use native, SIZE, or WIDTHxHEIGHT." >&2
+    exit 1
+  fi
+  REPLAY_CAMERA_ARGS=(--camera-width "$CAMERA_WIDTH" --camera-height "$CAMERA_HEIGHT")
+fi
 
 echo "[$(date +%H:%M:%S)] Step 1: Collecting $COLLECT_N PlugCharger-v1 trajectories (targeting $TARGET_DEMOS after filtering)..."
 python -m mani_skill.examples.motionplanning.panda.run \
@@ -37,6 +52,7 @@ python -m mani_skill.trajectory.replay_trajectory \
   --max-retry 3 \
   --no-allow-failure \
   --save-traj \
+  "${REPLAY_CAMERA_ARGS[@]}" \
   -n 1
 
 echo "[$(date +%H:%M:%S)] Step 3: Filtering trajectories > $MAX_STEPS steps..."

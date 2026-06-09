@@ -45,7 +45,6 @@ class Map4DDiT(nn.Module):
 
     trajectory_dim = 7
     object_dim = 9
-    tcp_dim = 7
 
     def __init__(
         self,
@@ -59,6 +58,7 @@ class Map4DDiT(nn.Module):
         size_parameter_dim: int = 0,
         rgb_feature_dim: int = 0,
         relation_parameter_dim: int = 0,
+        tcp_dim: int = 7,
         embed_dim: int = 256,
         depth: int = 6,
         num_heads: int = 8,
@@ -83,9 +83,12 @@ class Map4DDiT(nn.Module):
         self.size_parameter_dim = int(size_parameter_dim)
         self.rgb_feature_dim = int(rgb_feature_dim)
         self.relation_parameter_dim = int(relation_parameter_dim)
+        self.tcp_dim = int(tcp_dim)
         self.embed_dim = int(embed_dim)
         self.use_rgb = bool(use_rgb)
         self.max_context_tokens = int(max_context_tokens)
+        if self.tcp_dim not in {4, 7}:
+            raise ValueError(f"tcp_dim must be 4 or 7, got {self.tcp_dim}")
 
         self.trajectory_proj = nn.Linear(self.trajectory_dim, embed_dim)
         self.object_proj = nn.Linear(self.object_dim, embed_dim)

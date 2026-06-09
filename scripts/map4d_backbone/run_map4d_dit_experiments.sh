@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ $# -ne 2 ]]; then
-  echo "Usage: $0 <task[,task...]> <num_demo[,num_demo...]>" >&2
-  echo "Example: $0 stackcube,plugcharger 100,990" >&2
-  echo "Tasks: stackcube, plugcharger, all" >&2
+if [[ $# -ne 0 ]]; then
+  echo "Usage: $0" >&2
+  echo "Configure TASK_LIST and NUM_DEMOS_LIST inside the script, or override them with environment variables." >&2
   exit 1
 fi
 
@@ -15,6 +14,20 @@ NPROC_PER_NODE="${NPROC_PER_NODE:-1}"
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 WANDB_MODE="${WANDB_MODE:-offline}"
 export WANDB_MODE
+
+# Default experiment set. Override with environment variables when needed, e.g.
+#   TASK_LIST=plugcharger NUM_DEMOS_LIST=1000 CUDA_VISIBLE_DEVICES=3 bash ...
+TASK_LIST="${TASK_LIST:-stackcube}"
+NUM_DEMOS_LIST="${NUM_DEMOS_LIST:-1000}"
+BATCH_SIZE="${BATCH_SIZE:-512}"
+
+STACKCUBE_DEMO_PATH="${STACKCUBE_DEMO_PATH:-${DATA_ROOT}/ManiSkill/StackCube-v1/motionplanning/StackCube.rgb.pd_ee_delta_pos.physx_cpu.filtered.with_dinov3_vits16_224.h5}"
+STACKCUBE_MAP4D_DIT_SIDECAR_PATH="${STACKCUBE_MAP4D_DIT_SIDECAR_PATH:-${DATA_ROOT}/ManiSkill/StackCube-v1/motionplanning/StackCube.rgb.pd_ee_delta_pos.physx_cpu.filtered.with_dinov3_vits16_224.map4d_dit_h${FUTURE_HORIZON}.h5}"
+STACKCUBE_RGB_FEATURE_DIM="${STACKCUBE_RGB_FEATURE_DIM:-768}"
+
+PLUGCHARGER_DEMO_PATH="${PLUGCHARGER_DEMO_PATH:-${DATA_ROOT}/ManiSkill/PlugCharger-v1/motionplanning/PlugCharger.rgb.pd_ee_delta_pose.physx_cpu.filtered.h5}"
+PLUGCHARGER_MAP4D_DIT_SIDECAR_PATH="${PLUGCHARGER_MAP4D_DIT_SIDECAR_PATH:-${PLUGCHARGER_DEMO_PATH%.h5}.map4d_dit_h${FUTURE_HORIZON}.h5}"
+PLUGCHARGER_RGB_FEATURE_DIM="${PLUGCHARGER_RGB_FEATURE_DIM:-288}"
 
 if [[ "${CONDA_DEFAULT_ENV:-}" != "4dmap" && "${RUNNING_IN_4DMAP:-0}" != "1" ]]; then
   export RUNNING_IN_4DMAP=1
@@ -52,14 +65,16 @@ task_env() {
     stackcube)
       TASK_OVERRIDE="task=stackcube_map4d_dit"
       TASK_NAME="StackCube-v1"
-      DEMO_PATH="${STACKCUBE_DEMO_PATH:-${DATA_ROOT}/ManiSkill/StackCube-v1/motionplanning/StackCube.rgb.pd_ee_delta_pos.physx_cpu.filtered.h5}"
-      SIDECAR_PATH="${STACKCUBE_MAP4D_DIT_SIDECAR_PATH:-${DEMO_PATH%.h5}.map4d_dit_h${FUTURE_HORIZON}.h5}"
+      DEMO_PATH="${STACKCUBE_DEMO_PATH}"
+      SIDECAR_PATH="${STACKCUBE_MAP4D_DIT_SIDECAR_PATH}"
+      RGB_FEATURE_DIM="${STACKCUBE_RGB_FEATURE_DIM}"
       ;;
     plugcharger)
       TASK_OVERRIDE="task=plugcharger_map4d_dit"
       TASK_NAME="PlugCharger-v1"
-      DEMO_PATH="${PLUGCHARGER_DEMO_PATH:-${DATA_ROOT}/ManiSkill/PlugCharger-v1/motionplanning/PlugCharger.rgb.pd_ee_delta_pose.physx_cpu.filtered.h5}"
-      SIDECAR_PATH="${PLUGCHARGER_MAP4D_DIT_SIDECAR_PATH:-${DEMO_PATH%.h5}.map4d_dit_h${FUTURE_HORIZON}.h5}"
+      DEMO_PATH="${PLUGCHARGER_DEMO_PATH}"
+      SIDECAR_PATH="${PLUGCHARGER_MAP4D_DIT_SIDECAR_PATH}"
+      RGB_FEATURE_DIM="${PLUGCHARGER_RGB_FEATURE_DIM}"
       ;;
     *)
       echo "Internal error: unknown normalized task ${task}" >&2
@@ -68,9 +83,9 @@ task_env() {
   esac
 }
 
-split_csv "$1"
+split_csv "$TASK_LIST"
 RAW_TASKS=("${SPLIT_RESULT[@]}")
-split_csv "$2"
+split_csv "$NUM_DEMOS_LIST"
 NUM_DEMOS=("${SPLIT_RESULT[@]}")
 
 TASKS=()
@@ -115,6 +130,8 @@ for task in "${TASKS[@]}"; do
     echo "  num_demo: ${num_demo}"
     echo "  demo: ${DEMO_PATH}"
     echo "  sidecar: ${SIDECAR_PATH}"
+    echo "  rgb_feature_dim: ${RGB_FEATURE_DIM}"
+    echo "  batch_size: ${BATCH_SIZE}"
     echo "  log: ${THIS_LOG_FILE}"
 
     cmd=(
@@ -125,13 +142,16 @@ for task in "${TASKS[@]}"; do
       "seed=${SEED:-0}"
       "addition_info=${task}_${num_demo}demos"
       "task.dataset.num_traj=${num_demo}"
+      "policy.model_cfg.rgb_feature_dim=${RGB_FEATURE_DIM}"
+      "dataloader.batch_size=${BATCH_SIZE}"
+      "val_dataloader.batch_size=${BATCH_SIZE}"
       "training.debug=${DEBUG:-false}"
       "logging.mode=${WANDB_MODE}"
     )
 
     if [[ "${DRY_RUN:-0}" == "1" ]]; then
-      printf 'MAP4D_DEMO_PATH=%q MAP4D_KEYFRAME_SIDECAR_PATH=%q CUDA_VISIBLE_DEVICES=%q ' \
-        "$DEMO_PATH" "$SIDECAR_PATH" "$CUDA_VISIBLE_DEVICES"
+      printf 'MAP4D_DEMO_PATH=%q MAP4D_KEYFRAME_SIDECAR_PATH=%q MAP4D_NUM_TRAJ=%q CUDA_VISIBLE_DEVICES=%q ' \
+        "$DEMO_PATH" "$SIDECAR_PATH" "$num_demo" "$CUDA_VISIBLE_DEVICES"
       printf '%q ' "${cmd[@]}"
       printf '\n'
       continue
@@ -140,6 +160,7 @@ for task in "${TASKS[@]}"; do
     mkdir -p "$(dirname "$THIS_LOG_FILE")"
     MAP4D_DEMO_PATH="$DEMO_PATH" \
     MAP4D_KEYFRAME_SIDECAR_PATH="$SIDECAR_PATH" \
+    MAP4D_NUM_TRAJ="$num_demo" \
     CUDA_VISIBLE_DEVICES="$CUDA_VISIBLE_DEVICES" \
     "${cmd[@]}" 2>&1 | tee "$THIS_LOG_FILE"
   done

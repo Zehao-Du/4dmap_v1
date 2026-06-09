@@ -13,6 +13,9 @@ except ModuleNotFoundError:
 
 
 MAP4D_DIT_TARGET_FORMAT = "map4d_dit_local_delta_relative_rotation_v1"
+MAP4D_DIT_TCP_POS_GRIPPER_TARGET_FORMAT = (
+    "map4d_dit_local_delta_relative_rotation_tcp_pos_gripper_v1"
+)
 
 
 def canonicalize_quaternion_np(quat: np.ndarray, eps: float = 1e-8) -> np.ndarray:
@@ -225,6 +228,68 @@ def gather_map4d_dit_keyframe_targets(
     )
     tcp_delta_quat = relative_quaternion_np(current_tcp_quat, future_tcp_quat)
     tcp_targets = np.concatenate([tcp_local_delta_pos, tcp_delta_quat], axis=-1)
+    return object_targets.astype(np.float32), tcp_targets.astype(np.float32)
+
+
+def gather_map4d_dit_pos_gripper_keyframe_targets(
+    map4d: np.ndarray,
+    tcp_pose: np.ndarray,
+    gripper: np.ndarray,
+    future_keyframe_table: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Gather Map4D DiT targets with 4D TCP `local_delta_pos + gripper`.
+
+    This is used for StackCube-style `pd_ee_delta_pos` debugging, where the
+    robot target should stay aligned with the 4D action space.
+    """
+    map4d = np.asarray(map4d, dtype=np.float32)
+    tcp_pose = np.asarray(tcp_pose, dtype=np.float32)
+    gripper = np.asarray(gripper, dtype=np.float32).reshape(-1, 1)
+    indices = np.asarray(future_keyframe_table, dtype=np.int64)
+
+    if map4d.ndim != 3 or map4d.shape[-1] not in {9, 12}:
+        raise ValueError(f"Expected map4d shape [T, N, 9] or [T, N, 12], got {map4d.shape}")
+    if tcp_pose.ndim != 2 or tcp_pose.shape[-1] < 7 or tcp_pose.shape[0] != map4d.shape[0]:
+        raise ValueError(
+            f"Expected tcp_pose shape [T, >=7] with T={map4d.shape[0]}, got {tcp_pose.shape}"
+        )
+    if gripper.shape[0] != map4d.shape[0]:
+        raise ValueError(f"Expected gripper length {map4d.shape[0]}, got {gripper.shape[0]}")
+    if indices.ndim != 2 or indices.shape[0] != map4d.shape[0]:
+        raise ValueError(
+            f"Expected future_keyframe_table shape [T, H] with T={map4d.shape[0]}, got {indices.shape}"
+        )
+
+    indices = np.clip(indices, 0, map4d.shape[0] - 1)
+    future_map4d = map4d[indices]
+
+    object_pos, object_rot6d = _pose_map4d_parts(map4d)
+    future_obj_pos, future_obj_rot6d = _pose_map4d_parts(future_map4d)
+    current_obj_pos = object_pos[:, None]
+    current_obj_rot = rot6d_to_matrix_np(object_rot6d[:, None])
+    future_obj_rot = rot6d_to_matrix_np(future_obj_rot6d)
+    object_local_delta_pos = np.einsum(
+        "...ji,...j->...i",
+        current_obj_rot,
+        future_obj_pos - current_obj_pos,
+    )
+    object_relative_rot = np.einsum("...ji,...jk->...ik", current_obj_rot, future_obj_rot)
+    object_relative_rot6d = matrix_to_rot6d_np(object_relative_rot)
+    object_targets = np.concatenate(
+        [object_local_delta_pos, object_relative_rot6d], axis=-1
+    )
+
+    future_tcp = tcp_pose[indices]
+    current_tcp_pos = tcp_pose[:, None, 0:3]
+    current_tcp_quat = canonicalize_quaternion_np(tcp_pose[:, None, 3:7])
+    future_tcp_pos = future_tcp[..., 0:3]
+    current_tcp_rot = quat_to_matrix_np(current_tcp_quat)
+    tcp_local_delta_pos = np.einsum(
+        "...ji,...j->...i",
+        current_tcp_rot,
+        future_tcp_pos - current_tcp_pos,
+    )
+    tcp_targets = np.concatenate([tcp_local_delta_pos, gripper[indices]], axis=-1)
     return object_targets.astype(np.float32), tcp_targets.astype(np.float32)
 
 

@@ -5,6 +5,10 @@ robot_state_dim: 32
 map4d_dim: 9
 size_parameter_dim: 9
 relation_parameter_dim: 0
+keyframe_tcp_dim: 4
+eval_control_mode: pd_ee_delta_pos
+eval_max_episode_steps: 100
+eval_action_mode: pos_gripper
 
 dataset:
   _target_: map4d.backbone.dataset.maniskill_map4d_dataset.ManiSkillMap4DDataset
@@ -23,6 +27,7 @@ dataset:
   use_rgb: ${policy.model_cfg.use_rgb}
   use_depth: false
   rgb_feature_dim: ${policy.model_cfg.rgb_feature_dim}
+  keyframe_tcp_dim: ${task.keyframe_tcp_dim}
   allow_missing_rgb_feature: false
   allow_raw_rgb_stats_feature: false
   num_traj: ${oc.env:MAP4D_NUM_TRAJ,null}

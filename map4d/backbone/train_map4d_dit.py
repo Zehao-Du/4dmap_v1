@@ -30,6 +30,7 @@ import yaml
 from map4d.backbone.common.checkpoint_util import TopKCheckpointManager
 from map4d.backbone.common.pytorch_util import dict_apply, optimizer_to
 from map4d.backbone.dataset.base_dataset import BaseDataset
+from map4d.backbone.eval_maniskill import build_rollout_evaluator
 from map4d.backbone.model.common.lr_scheduler import get_scheduler
 from map4d.backbone.model.diffusion.ema_model import EMAModel
 from map4d.backbone.policy.map4d_dit_policy import Map4DDiTPolicy
@@ -175,6 +176,10 @@ class TrainMap4DDiTWorkspace:
             with open(os.path.join(self.output_dir, "config.yaml"), "w", encoding="utf-8") as f:
                 yaml.safe_dump(OmegaConf.to_container(cfg, resolve=True), f)
 
+        rollout_evaluator = None
+        if self._rank0():
+            rollout_evaluator = build_rollout_evaluator(cfg, device=device, output_dir=self.output_dir)
+
         wandb_run = None
         if self._rank0() and cfg.logging.mode != "disabled":
             try:
@@ -268,6 +273,22 @@ class TrainMap4DDiTWorkspace:
                     step_log["sample_quat_norm"] = float(quat_norm.detach().cpu())
 
             if (
+                rollout_evaluator is not None
+                and self.epoch > 0
+                and self.epoch % int(cfg.rollout.every) == 0
+            ):
+                eval_policy = self._policy_for_eval()
+                eval_policy.eval()
+                rollout_metrics = rollout_evaluator.evaluate(eval_policy, self.epoch)
+                if self._rank0():
+                    for key, value in rollout_metrics.items():
+                        step_log[f"rollout/{key}"] = float(value)
+                    print(
+                        "rollout "
+                        + ", ".join(f"{key}={value:.4f}" for key, value in rollout_metrics.items())
+                    )
+
+            if (
                 self._rank0()
                 and cfg.checkpoint.save_ckpt
                 and self.epoch % int(cfg.training.checkpoint_every) == 0
@@ -286,6 +307,9 @@ class TrainMap4DDiTWorkspace:
             self.epoch += 1
             if self.distributed:
                 dist.barrier()
+
+        if rollout_evaluator is not None:
+            rollout_evaluator.close()
 
     def save_checkpoint(self, path=None, tag="latest"):
         if path is None:
