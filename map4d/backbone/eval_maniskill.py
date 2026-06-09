@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import gc
 import sys
 import time
 from collections import defaultdict
@@ -177,6 +178,10 @@ class Map4DDiTManiSkillEvaluator:
         if self.env is not None:
             self.env.close()
             self.env = None
+        self.robot_history = []
+        self.map4d_history = []
+        self.rgb_history = []
+        gc.collect()
 
     def _ensure_env(self):
         if self.env is not None:
@@ -247,6 +252,8 @@ class Map4DDiTManiSkillEvaluator:
                         self._reset_history(obs)
         finally:
             progress.close()
+            if bool(self.cfg.get("close_after_eval", True)):
+                self.close()
 
         mean_metrics = {}
         for key, values in eval_metrics.items():

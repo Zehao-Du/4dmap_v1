@@ -104,6 +104,7 @@ rollout:
   every: 100
   num_eval_episodes: 100
   num_eval_envs: 10
+  close_after_eval: true
   sim_backend: physx_cuda
   obs_mode: rgb
   control_mode: ${task.eval_control_mode}
