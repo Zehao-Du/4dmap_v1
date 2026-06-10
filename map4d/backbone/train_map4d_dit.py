@@ -11,6 +11,7 @@ if __name__ == "__main__":
         sys.path.insert(0, ROOT_DIR)
 
 import copy
+import json
 import os
 import pathlib
 import random
@@ -193,6 +194,27 @@ class TrainMap4DDiTWorkspace:
             except Exception as exc:
                 print(f"wandb disabled: {exc}")
 
+        local_metrics_path = None
+        local_metrics_every = int(OmegaConf.select(cfg, "metrics.local_every", default=100))
+        local_metrics_enabled = bool(OmegaConf.select(cfg, "metrics.local", default=True))
+        if self._rank0() and local_metrics_enabled:
+            local_metrics_name = OmegaConf.select(
+                cfg, "metrics.local_name", default="train_metrics.jsonl"
+            )
+            local_metrics_path = os.path.join(self.output_dir, str(local_metrics_name))
+
+        def write_local_metrics(record):
+            if local_metrics_path is None:
+                return
+            serializable = {}
+            for key, value in record.items():
+                if isinstance(value, (int, float, str, bool)) or value is None:
+                    serializable[key] = value
+                elif hasattr(value, "item"):
+                    serializable[key] = value.item()
+            with open(local_metrics_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(serializable, sort_keys=True) + "\n")
+
         topk_manager = TopKCheckpointManager(
             save_dir=os.path.join(self.output_dir, "checkpoints"),
             **cfg.checkpoint.topk,
@@ -203,6 +225,8 @@ class TrainMap4DDiTWorkspace:
             if train_sampler is not None:
                 train_sampler.set_epoch(local_epoch_idx)
             train_losses = []
+            train_metric_sums = {}
+            train_metric_count = 0
             step_log = {}
             self.model.train()
             with tqdm.tqdm(
@@ -229,6 +253,9 @@ class TrainMap4DDiTWorkspace:
 
                     raw_loss_value = float(raw_loss.detach().cpu())
                     train_losses.append(raw_loss_value)
+                    for key, value in loss_dict.items():
+                        train_metric_sums[key] = train_metric_sums.get(key, 0.0) + float(value)
+                    train_metric_count += 1
                     if self._rank0():
                         tepoch.set_postfix(loss=raw_loss_value, refresh=False)
                         step_log = {
@@ -240,12 +267,17 @@ class TrainMap4DDiTWorkspace:
                         }
                         if wandb_run is not None:
                             wandb_run.log(step_log, step=self.global_step)
+                        if local_metrics_every > 0 and self.global_step % local_metrics_every == 0:
+                            write_local_metrics({**step_log, "record_type": "train_step"})
                     self.global_step += 1
                     if cfg.training.max_train_steps is not None and batch_idx >= int(cfg.training.max_train_steps) - 1:
                         break
 
             if self._rank0() and train_losses:
                 step_log["train_loss"] = float(np.mean(train_losses))
+                if train_metric_count > 0:
+                    for key, value in train_metric_sums.items():
+                        step_log[key] = value / train_metric_count
 
             if val_dataloader is not None and self.epoch % int(cfg.training.val_every) == 0:
                 if val_sampler is not None:
@@ -279,7 +311,11 @@ class TrainMap4DDiTWorkspace:
             ):
                 eval_policy = self._policy_for_eval()
                 eval_policy.eval()
-                rollout_metrics = rollout_evaluator.evaluate(eval_policy, self.epoch)
+                rollout_metrics = rollout_evaluator.evaluate(
+                    eval_policy,
+                    epoch=self.epoch,
+                    iteration=self.global_step,
+                )
                 if self._rank0():
                     for key, value in rollout_metrics.items():
                         step_log[f"rollout/{key}"] = float(value)
@@ -304,6 +340,8 @@ class TrainMap4DDiTWorkspace:
 
             if self._rank0() and wandb_run is not None and step_log:
                 wandb_run.log(step_log, step=self.global_step)
+            if self._rank0() and step_log:
+                write_local_metrics({**step_log, "record_type": "epoch"})
             self.epoch += 1
             if self.distributed:
                 dist.barrier()

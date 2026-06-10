@@ -105,6 +105,8 @@ rollout:
   num_eval_episodes: 100
   num_eval_envs: 10
   close_after_eval: true
+  metrics_dir: outputs/eval_metrics
+  run_name: ${alg_name}_${addition_info}_seed${seed}
   sim_backend: physx_cuda
   obs_mode: rgb
   control_mode: ${task.eval_control_mode}
@@ -126,6 +128,11 @@ logging:
   resume: true
   tags:
     - ${wandb_name}
+
+metrics:
+  local: true
+  local_every: 100
+  local_name: train_metrics.jsonl
 
 checkpoint:
   save_ckpt: true

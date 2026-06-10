@@ -4,6 +4,7 @@ outputs/
 runs/
 
 # experiment logs
+exp_logs/
 wandb/
 videos/
 *.log

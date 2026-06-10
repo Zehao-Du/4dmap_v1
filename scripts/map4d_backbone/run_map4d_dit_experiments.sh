@@ -12,22 +12,38 @@ DATA_ROOT="${DATA_ROOT:-/data2/zehao/MAP4D/dataset}"
 FUTURE_HORIZON="${FUTURE_HORIZON:-4}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-1}"
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+MASTER_PORT="${MASTER_PORT:-29570}"
 WANDB_MODE="${WANDB_MODE:-offline}"
 export WANDB_MODE
 
-# Default experiment set. Override with environment variables when needed, e.g.
-#   TASK_LIST=plugcharger NUM_DEMOS_LIST=1000 CUDA_VISIBLE_DEVICES=3 bash ...
+# ======================== EDIT HERE: experiment selection ========================
+# TASK_LIST controls which task(s) to train.
+#   Options: stackcube, plugcharger, all
+# NUM_DEMOS_LIST controls how many trajectories are used.
+#   Use one value or comma-separated values, e.g. 1000 or 100,990,1000.
+#
+# You can edit the defaults below, or override them from the command line:
+#   TASK_LIST=plugcharger NUM_DEMOS_LIST=1000 CUDA_VISIBLE_DEVICES=3 MASTER_PORT=29571 bash scripts/map4d_backbone/run_map4d_dit_experiments.sh
 TASK_LIST="${TASK_LIST:-stackcube}"
 NUM_DEMOS_LIST="${NUM_DEMOS_LIST:-1000}"
 BATCH_SIZE="${BATCH_SIZE:-512}"
+# ====================== END EDIT: experiment selection ===========================
 
+# =========================== EDIT HERE: dataset paths ============================
+# StackCube inputs.
+#   STACKCUBE_DEMO_PATH is the main ManiSkill .h5 with DINOv3 features.
+#   STACKCUBE_MAP4D_DIT_SIDECAR_PATH is the keyframe/object/tcp sidecar .h5.
+#   STACKCUBE_RGB_FEATURE_DIM must match the feature dimension in DEMO_PATH.
 STACKCUBE_DEMO_PATH="${STACKCUBE_DEMO_PATH:-${DATA_ROOT}/ManiSkill/StackCube-v1/motionplanning/StackCube.rgb.pd_ee_delta_pos.physx_cpu.filtered.with_dinov3_vits16_224.h5}"
 STACKCUBE_MAP4D_DIT_SIDECAR_PATH="${STACKCUBE_MAP4D_DIT_SIDECAR_PATH:-${DATA_ROOT}/ManiSkill/StackCube-v1/motionplanning/StackCube.rgb.pd_ee_delta_pos.physx_cpu.filtered.with_dinov3_vits16_224.map4d_dit_h${FUTURE_HORIZON}.h5}"
 STACKCUBE_RGB_FEATURE_DIM="${STACKCUBE_RGB_FEATURE_DIM:-768}"
 
+# PlugCharger inputs.
+#   Update these if the demo file, sidecar, or vision feature dimension changes.
 PLUGCHARGER_DEMO_PATH="${PLUGCHARGER_DEMO_PATH:-${DATA_ROOT}/ManiSkill/PlugCharger-v1/motionplanning/PlugCharger.rgb.pd_ee_delta_pose.physx_cpu.filtered.h5}"
 PLUGCHARGER_MAP4D_DIT_SIDECAR_PATH="${PLUGCHARGER_MAP4D_DIT_SIDECAR_PATH:-${PLUGCHARGER_DEMO_PATH%.h5}.map4d_dit_h${FUTURE_HORIZON}.h5}"
 PLUGCHARGER_RGB_FEATURE_DIM="${PLUGCHARGER_RGB_FEATURE_DIM:-288}"
+# ========================= END EDIT: dataset paths ===============================
 
 if [[ "${CONDA_DEFAULT_ENV:-}" != "4dmap" && "${RUNNING_IN_4DMAP:-0}" != "1" ]]; then
   export RUNNING_IN_4DMAP=1
@@ -104,6 +120,7 @@ done
 
 cd "$ROOT_DIR"
 mkdir -p outputs/map4d_backbone_train_logs
+run_idx=0
 
 for task in "${TASKS[@]}"; do
   task_env "$task"
@@ -124,6 +141,8 @@ for task in "${TASKS[@]}"; do
   for num_demo in "${NUM_DEMOS[@]}"; do
     RUN_NAME="${RUN_NAME_PREFIX:-map4d_dit}_${task}_${num_demo}demos_seed${SEED:-0}"
     THIS_LOG_FILE="${LOG_FILE:-outputs/map4d_backbone_train_logs/${RUN_NAME}.log}"
+    THIS_MASTER_PORT="$((MASTER_PORT + run_idx))"
+    run_idx="$((run_idx + 1))"
 
     echo "[$(date +%H:%M:%S)] running ${RUN_NAME}"
     echo "  task: ${TASK_NAME}"
@@ -132,10 +151,11 @@ for task in "${TASKS[@]}"; do
     echo "  sidecar: ${SIDECAR_PATH}"
     echo "  rgb_feature_dim: ${RGB_FEATURE_DIM}"
     echo "  batch_size: ${BATCH_SIZE}"
+    echo "  master_port: ${THIS_MASTER_PORT}"
     echo "  log: ${THIS_LOG_FILE}"
 
     cmd=(
-      torchrun --nproc_per_node="${NPROC_PER_NODE}"
+      torchrun --master_port="${THIS_MASTER_PORT}" --nproc_per_node="${NPROC_PER_NODE}"
       map4d/backbone/train_map4d_dit.py
       --config-name map4d_dit
       "${TASK_OVERRIDE}"

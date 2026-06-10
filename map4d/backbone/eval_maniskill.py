@@ -221,7 +221,12 @@ class Map4DDiTManiSkillEvaluator:
                 device=self.device,
             )
 
-    def evaluate(self, policy: Map4DDiTPolicy, epoch: int) -> Dict[str, float]:
+    def evaluate(
+        self,
+        policy: Map4DDiTPolicy,
+        epoch: int,
+        iteration: Optional[int] = None,
+    ) -> Dict[str, float]:
         self._ensure_env()
         policy.eval()
         eval_metrics = defaultdict(list)
@@ -258,7 +263,7 @@ class Map4DDiTManiSkillEvaluator:
         mean_metrics = {}
         for key, values in eval_metrics.items():
             mean_metrics[key] = float(np.mean(np.stack(values)))
-        self._write_metrics(epoch, mean_metrics)
+        self._write_metrics(epoch, iteration, mean_metrics)
         return mean_metrics
 
     def _reset_history(self, obs):
@@ -405,17 +410,35 @@ class Map4DDiTManiSkillEvaluator:
         else:
             raise KeyError(f"Expected episode metrics in info, got keys: {list(info.keys())}")
 
-    def _write_metrics(self, epoch: int, metrics: Dict[str, float]):
-        path = Path(self.output_dir) / "rollout_metrics.jsonl"
-        record = {
+    def _metrics_record(self, epoch: int, iteration: Optional[int], metrics: Dict[str, float]):
+        return {
             "epoch": int(epoch),
-            "time": time.time(),
+            "iteration": int(epoch if iteration is None else iteration),
             "num_eval_episodes": int(self.cfg.num_eval_episodes),
-            "num_eval_envs": int(self.cfg.num_eval_envs),
+            "run_name": str(self.cfg.run_name),
             **metrics,
         }
+
+    def _write_metrics(self, epoch: int, iteration: Optional[int], metrics: Dict[str, float]):
+        record = self._metrics_record(epoch, iteration, metrics)
+        run_dir_record = {
+            "time": time.time(),
+            "num_eval_envs": int(self.cfg.num_eval_envs),
+            **record,
+        }
+
+        path = Path(self.output_dir) / "rollout_metrics.jsonl"
         with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(run_dir_record, sort_keys=True) + "\n")
+
+        metrics_dir = Path(str(self.cfg.metrics_dir))
+        if not metrics_dir.is_absolute():
+            metrics_dir = PROJECT_ROOT / metrics_dir
+        metrics_dir.mkdir(parents=True, exist_ok=True)
+        eval_metrics_path = metrics_dir / f"{self.cfg.run_name}.jsonl"
+        with eval_metrics_path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(record, sort_keys=True) + "\n")
+        print(f"Eval metrics written to {eval_metrics_path}")
 
 
 def build_rollout_evaluator(cfg: DictConfig, *, device: torch.device, output_dir: str) -> Optional[Map4DDiTManiSkillEvaluator]:
