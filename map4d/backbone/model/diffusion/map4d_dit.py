@@ -301,3 +301,66 @@ class Map4DDiT(nn.Module):
             "gripper_openness": pred_gripper,
             "trajectory_features": traj_feat,
         }
+
+
+class DiffusionHeadMap4D(nn.Module):
+    def __init__(self,
+                 embedding_dim=120                                                                                                                               ,
+                 num_attn_heads=8,
+                 use_instruction=True,
+                 rotation_parametrization='quat',
+                 nhist=1,
+                 lang_enhanced=False,
+                 horizon_keyframe=2,
+                 horizon_continuous=3
+    ):
+        super().__init__()
+    
+    def forward(self, trajectory_left, trajectory_right, timestep,
+            fixed_inputs):
+        # set_trace()
+        (pcd_coord, pcd_feat, lang_feat, state_feat, sampled_pcd_coord, sampled_pcd_feat, pointflow_feat, pointflow_coords) = fixed_inputs
+        
+        # Trajectory features(noisy actions, concatenation of keypose and continuous actions)
+        traj_feats_left = self.traj_encoder(trajectory_left)
+        traj_feats_right = self.traj_encoder(trajectory_right)
+
+        # Trajectory features cross-attend to context features
+        traj_time_pos = self.traj_time_emb(
+            torch.arange(0, traj_feats_left.size(1), device=traj_feats_left.device)
+        )[None].repeat(len(traj_feats_left), 1, 1)
+        
+        if self.use_instruction:
+            traj_feats_left, _ = self.traj_lang_attention_left[0](
+                seq1=traj_feats_left, seq1_key_padding_mask=None,
+                seq2=lang_feat, seq2_key_padding_mask=None,
+                seq1_pos=None, seq2_pos=None,
+                seq1_sem_pos=traj_time_pos, seq2_sem_pos=None
+            )
+
+            traj_feats_right, _ = self.traj_lang_attention_right[0](
+                seq1=traj_feats_right, seq1_key_padding_mask=None,
+                seq2=lang_feat, seq2_key_padding_mask=None,
+                seq1_pos=None, seq2_pos=None,
+                seq1_sem_pos=traj_time_pos, seq2_sem_pos=None
+            )
+            
+        traj_feats_left = traj_feats_left + traj_time_pos
+        traj_feats_right = traj_feats_right + traj_time_pos
+
+        traj_feats_left = einops.rearrange(traj_feats_left, 'b l c -> l b c')
+        traj_feats_right = einops.rearrange(traj_feats_right, 'b l c -> l b c')
+        pcd_feat = einops.rearrange(pcd_feat, 'b l c -> l b c')
+        sampled_pcd_feat = einops.rearrange(sampled_pcd_feat, 'b l c -> l b c')
+        state_feat = einops.rearrange(state_feat, 'b l c -> l b c')
+        pointflow_feat = einops.rearrange(pointflow_feat, 'b l c -> l b c')
+        
+        pos_pred_left, rot_pred_left, openess_pred_left, pos_pred_right, rot_pred_right, openess_pred_right, position_point_flow = self.prediction_head(
+            trajectory_left[..., :3], traj_feats_left,
+            trajectory_right[..., :3], traj_feats_right,
+            pcd_coord[..., :3], pcd_feat,
+            timestep, state_feat,
+            sampled_pcd_coord, sampled_pcd_feat,
+            lang_feat, pointflow_feat, pointflow_coords
+        )
+        return ([torch.cat((pos_pred_left, rot_pred_left, openess_pred_left), -1)],[torch.cat((pos_pred_right, rot_pred_right, openess_pred_right), -1)],[position_point_flow])

@@ -340,6 +340,45 @@ class TrainMap4DDiTWorkspace:
 
             if self._rank0() and wandb_run is not None and step_log:
                 wandb_run.log(step_log, step=self.global_step)
+
+            # Environment evaluation
+            eval_env_every = int(cfg.training.get("eval_env_every", 0))
+            if (
+                self._rank0()
+                and eval_env_every > 0
+                and self.epoch > 0
+                and self.epoch % eval_env_every == 0
+            ):
+                from map4d.backbone.evaluate_maniskill import evaluate_maniskill
+
+                eval_policy = self._policy_for_eval()
+                eval_policy.eval()
+                try:
+                    env_metrics = evaluate_maniskill(
+                        eval_policy,
+                        cfg.task_name,
+                        num_eval_episodes=int(cfg.training.get("num_eval_episodes", 100)),
+                        num_eval_envs=int(cfg.training.get("num_eval_envs", 10)),
+                        n_obs_steps=int(cfg.n_obs_steps),
+                        robot_state_dim=int(cfg.robot_state_dim),
+                        size_parameter_dim=int(cfg.task.get("size_parameter_dim", 0)),
+                        relation_parameter_dim=int(cfg.task.get("relation_parameter_dim", 0)),
+                        device=device,
+                        use_rgb=False,
+                        rgb_feature_dim=int(cfg.policy.model_cfg.get("rgb_feature_dim", 384)),
+                    )
+                    print(f"[Epoch {self.epoch}] Env eval: {env_metrics}")
+                    step_log.update({f"eval/{k}": v for k, v in env_metrics.items()})
+                    if wandb_run is not None:
+                        wandb_run.log({f"eval/{k}": v for k, v in env_metrics.items()}, step=self.global_step)
+                    success_once = env_metrics.get("success_once", 0.0)
+                    if success_once > getattr(self, "_best_success_once", 0.0):
+                        self._best_success_once = success_once
+                        print(f"  New best success_once: {success_once:.4f}. Saving checkpoint.")
+                        self.save_checkpoint(tag="best_success")
+                except Exception as exc:
+                    print(f"[Epoch {self.epoch}] Env eval failed: {exc}")
+
             if self._rank0() and step_log:
                 write_local_metrics({**step_log, "record_type": "epoch"})
             self.epoch += 1

@@ -50,13 +50,14 @@ def create_mlp(
 
 class ObservationEncoder(nn.Module):
     def __init__(self, 
+                 state_shape=8,
                  out_channel=288,
+                 dim_dino_feature=384,
                  state_mlp_size=(128, 288), state_mlp_activation_fn=nn.ReLU,
                  lang_mlp_size=(288, 288), lang_mlp_activation_fn=nn.ReLU,
                  pcd_mlp_size=(288,288), pcd_mlp_activation_fn=nn.ReLU,
                  pointcloud_encoder_cfg=None,
                  use_lang=False,
-                 use_initial_pointflow=True,
                  scene_pcd_num=6144,
                  ):
         super().__init__()
@@ -65,10 +66,10 @@ class ObservationEncoder(nn.Module):
         self.point_cloud_key = 'point_cloud'
         self.lang_key = 'lang'
         self.out_channel = out_channel
+        self.dim_dino_feature = dim_dino_feature
         
-        self.state_shape = 16   # dual arm ee pose
+        self.state_shape = state_shape   # 16 when dual arm ee pose, 8 when single arm ee pose
         self.lang_shape = 1024  
-        self.use_initial_pointflow=use_initial_pointflow
         self.pcd_mlp_size = pcd_mlp_size
         self.pointnet_encoder = PointNet2DenseEncoder(**pointcloud_encoder_cfg)
         
@@ -83,8 +84,6 @@ class ObservationEncoder(nn.Module):
 
         self.state_mlp = nn.Sequential(*create_mlp(self.state_shape, output_dim, net_arch, state_mlp_activation_fn))
         self.pcd_mlp = nn.Sequential(*create_mlp(384, pcd_mlp_size[-1], pcd_mlp_size[:-1], pcd_mlp_activation_fn))
-        if self.use_initial_pointflow:
-            self.point_flow_mlp = nn.Sequential(*create_mlp(3, pcd_mlp_size[-1], pcd_mlp_size[:-1], pcd_mlp_activation_fn))
         if use_lang:
             if len(lang_mlp_size) == 0:
                 raise RuntimeError(f"Language mlp size is empty")
@@ -100,8 +99,6 @@ class ObservationEncoder(nn.Module):
         # set_trace()
         points = observations[self.point_cloud_key]
         dino_feature = observations["dino_feature"]
-        if self.use_initial_pointflow:
-            initial_point_flow = observations["initial_point_flow"]
         ptc_wth_feature = torch.cat((points,dino_feature),dim=2)
 
         ptc_wth_feature = torch.transpose(ptc_wth_feature, 1, 2)
@@ -113,14 +110,9 @@ class ObservationEncoder(nn.Module):
         state_feat = self.state_mlp(state)
         lang = observations[self.lang_key]
         lang_feat = self.lang_mlp(lang)
-        dino_feature = dino_feature.reshape(-1,384)
+        dino_feature = dino_feature.reshape(-1,self.dim_dino_feature)
         pcd_feat = self.pcd_mlp(dino_feature).reshape(-1,self.scene_pcd_num,self.pcd_mlp_size[-1])
         
-        if self.use_initial_pointflow:
-            fps = initial_point_flow.shape[1]
-            initial_point_flow = initial_point_flow.reshape(-1,3)
-            point_flow_feat = self.point_flow_mlp(initial_point_flow).reshape(-1,fps,self.pcd_mlp_size[-1])
-            return (points, pcd_feat, lang_feat, state_feat, sampled_pcd_coord, sampled_pcd_feat, point_flow_feat, initial_point_flow.reshape(-1,fps,3))
         return (points, pcd_feat, lang_feat, state_feat, sampled_pcd_coord, sampled_pcd_feat)
 
 

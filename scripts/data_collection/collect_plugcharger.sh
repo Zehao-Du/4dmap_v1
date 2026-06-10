@@ -3,10 +3,10 @@
 # Only keeps trajectories <= 400 steps (filters out long retry trajectories)
 # Reference: 4dmap_policy/README.md
 set -e
-ROOT_DIR=/data2/zehao/MAP4D
-DATASET_DIR="$ROOT_DIR/dataset/ManiSkill/PlugCharger-v1/motionplanning"
-RECORD_DIR="$ROOT_DIR/dataset/ManiSkill"
-POLICY_DIR="$ROOT_DIR/4dmap_v1"
+ROOT_DIR="${ROOT_DIR:-/inspire/hdd/project/robot-dna/baojiachun-CZXS25130063/zehao/4dmap}"
+DATASET_DIR="${DATASET_DIR:-$ROOT_DIR/dataset/ManiSkill/PlugCharger-v1/motionplanning}"
+RECORD_DIR="${RECORD_DIR:-$ROOT_DIR/dataset/ManiSkill}"
+POLICY_DIR="${POLICY_DIR:-$ROOT_DIR/4dmap_policy}"
 
 echo "Cleaning old data in $DATASET_DIR ..."
 rm -f "$DATASET_DIR"/PlugCharger*.h5 "$DATASET_DIR"/PlugCharger*.json
@@ -15,10 +15,11 @@ mkdir -p "$DATASET_DIR"
 TARGET_DEMOS=${1:-1000}
 MAX_STEPS=400
 NUM_PROCS=${2:-10}
-IMAGE_SIZE=${3:-}
+IMAGE_SIZE=${3:-224}
+OBS_MODE="${OBS_MODE:-rgb+depth}"
 # Collect extra to account for filtering (empirically ~65% pass the filter)
 COLLECT_N=$(( TARGET_DEMOS * 2 ))
-REPLAY_CAMERA_ARGS=()
+PATCH_CAMERA_CONFIG=0
 if [[ -n "$IMAGE_SIZE" && "$IMAGE_SIZE" != "native" ]]; then
   if [[ "$IMAGE_SIZE" =~ ^[0-9]+$ ]]; then
     CAMERA_WIDTH="$IMAGE_SIZE"
@@ -30,7 +31,7 @@ if [[ -n "$IMAGE_SIZE" && "$IMAGE_SIZE" != "native" ]]; then
     echo "Invalid IMAGE_SIZE=$IMAGE_SIZE. Use native, SIZE, or WIDTHxHEIGHT." >&2
     exit 1
   fi
-  REPLAY_CAMERA_ARGS=(--camera-width "$CAMERA_WIDTH" --camera-height "$CAMERA_HEIGHT")
+  PATCH_CAMERA_CONFIG=1
 fi
 
 echo "[$(date +%H:%M:%S)] Step 1: Collecting $COLLECT_N PlugCharger-v1 trajectories (targeting $TARGET_DEMOS after filtering)..."
@@ -43,24 +44,38 @@ python -m mani_skill.examples.motionplanning.panda.run \
   --record-dir "$RECORD_DIR" \
   --num-procs "$NUM_PROCS"
 
-echo "[$(date +%H:%M:%S)] Step 2: Replaying to rgb + pd_ee_delta_pose..."
+if [[ "$PATCH_CAMERA_CONFIG" == "1" ]]; then
+  python -c "
+import json
+path = '$DATASET_DIR/PlugCharger.json'
+with open(path, 'r') as f:
+    data = json.load(f)
+env_kwargs = data.setdefault('env_info', {}).setdefault('env_kwargs', {})
+sensor_configs = env_kwargs.setdefault('sensor_configs', {})
+sensor_configs['width'] = int('$CAMERA_WIDTH')
+sensor_configs['height'] = int('$CAMERA_HEIGHT')
+with open(path, 'w') as f:
+    json.dump(data, f)
+"
+fi
+
+echo "[$(date +%H:%M:%S)] Step 2: Replaying to ${OBS_MODE} + pd_ee_delta_pose..."
 python -m mani_skill.trajectory.replay_trajectory \
   --traj-path "$DATASET_DIR/PlugCharger.h5" \
-  -o rgb \
+  -o "$OBS_MODE" \
   -c pd_ee_delta_pose \
   --no-verbose \
   --max-retry 3 \
   --no-allow-failure \
   --save-traj \
-  "${REPLAY_CAMERA_ARGS[@]}" \
   -n 1
 
 echo "[$(date +%H:%M:%S)] Step 3: Filtering trajectories > $MAX_STEPS steps..."
 python -c "
 import h5py, json, os, sys
 
-src = '$DATASET_DIR/PlugCharger.rgb.pd_ee_delta_pose.physx_cpu.h5'
-dst = '$DATASET_DIR/PlugCharger.rgb.pd_ee_delta_pose.physx_cpu.filtered.h5'
+src = '$DATASET_DIR/PlugCharger.$OBS_MODE.pd_ee_delta_pose.physx_cpu.h5'
+dst = '$DATASET_DIR/PlugCharger.$OBS_MODE.pd_ee_delta_pose.physx_cpu.filtered.h5'
 max_steps = $MAX_STEPS
 target = $TARGET_DEMOS
 
@@ -90,5 +105,5 @@ if os.path.exists(json_src):
 "
 
 echo "[$(date +%H:%M:%S)] Done."
-echo "Filtered dataset: $DATASET_DIR/PlugCharger.rgb.pd_ee_delta_pose.physx_cpu.filtered.h5"
+echo "Filtered dataset: $DATASET_DIR/PlugCharger.$OBS_MODE.pd_ee_delta_pose.physx_cpu.filtered.h5"
 ls -la "$DATASET_DIR"/PlugCharger*.filtered.*

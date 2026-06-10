@@ -2,33 +2,33 @@
 # One-click dataset builder for standalone DiTMap/Map4D DiT training.
 #
 # Usage:
-#   bash scripts/data_collection/DiTMap4D/build_dataset.sh <task> <demos> <vision_model> <resolution>
+#   bash scripts/data_collection/DiTMap4D/build_dataset.sh <task> <demos> <vision_model> [resolution]
 #
 # Examples:
 #   bash scripts/data_collection/DiTMap4D/build_dataset.sh stackcube 100 dinov3_vits16 224
 #   SKIP_COLLECT=1 DINOV3_WEIGHTS_PATH=/path/to/dinov3_vits16.pth \
-#     bash scripts/data_collection/DiTMap4D/build_dataset.sh plugcharger 1000 dinov3_vits16 native
+#     bash scripts/data_collection/DiTMap4D/build_dataset.sh plugcharger 1000 dinov3_vits16 224
 #
 # Outputs:
 #   1) filtered ManiSkill demo, collected by scripts/data_collection/collect_*.sh
-#   2) train demo with obs/dino_feature when vision_model is dinov3_*
+#   2) train demo with per-camera obs/dino_feature/<camera> when vision_model is dinov3_*
 #      resolution controls ManiSkill replay camera size when collecting, and
 #      DINO input resize when generating features
 #   3) Map4D DiT keyframe sidecar with target_format=map4d_dit_local_delta_relative_rotation_v1
 #   4) a .env manifest with paths and suggested Hydra overrides
 set -euo pipefail
 
-if [[ $# -ne 4 ]]; then
-  echo "Usage: $0 <task> <demos> <vision_model> <resolution>" >&2
+if [[ $# -lt 3 || $# -gt 4 ]]; then
+  echo "Usage: $0 <task> <demos> <vision_model> [resolution]" >&2
   echo "  task: stackcube|plugcharger|StackCube-v1|PlugCharger-v1" >&2
   echo "  demos: positive integer, e.g. 100 or 1000" >&2
   echo "  vision_model: dinov3_vits16|dinov3_vits16plus|dinov3_vitb16|dinov3_vitl16|dinov3_vith16plus|none" >&2
-  echo "  resolution: native|SIZE|HEIGHTxWIDTH, e.g. native, 224, 224x224" >&2
+  echo "  resolution: native|SIZE|HEIGHTxWIDTH, default 224" >&2
   exit 1
 fi
 
-ROOT_DIR="${ROOT_DIR:-/data2/zehao/MAP4D}"
-POLICY_DIR="${POLICY_DIR:-${ROOT_DIR}/4dmap_v1}"
+ROOT_DIR="${ROOT_DIR:-/inspire/hdd/project/robot-dna/baojiachun-CZXS25130063/zehao/4dmap}"
+POLICY_DIR="${POLICY_DIR:-${ROOT_DIR}/4dmap_policy}"
 DATA_ROOT="${DATA_ROOT:-${ROOT_DIR}/dataset}"
 FUTURE_HORIZON="${FUTURE_HORIZON:-4}"
 NUM_PROCS="${NUM_PROCS:-10}"
@@ -39,10 +39,15 @@ GRIPPER_SOURCE="${GRIPPER_SOURCE:-auto}"
 STOPPING_DELTA="${STOPPING_DELTA:-0.1}"
 MIN_SEPARATION="${MIN_SEPARATION:-1}"
 CAMERAS="${CAMERAS:-auto}"
+OBS_MODE="${OBS_MODE:-rgb+depth}"
+BUILD_POINTCLOUD="${BUILD_POINTCLOUD:-1}"
+POINTCLOUD_NUM_POINTS="${POINTCLOUD_NUM_POINTS:-6144}"
+POINTCLOUD_BBOX="${POINTCLOUD_BBOX:-auto}"
+POINTCLOUD_SEED="${POINTCLOUD_SEED:-0}"
 DINOV3_BATCH_SIZE="${DINOV3_BATCH_SIZE:-64}"
 DINOV3_DEVICE="${DINOV3_DEVICE:-auto}"
 DINOV3_POOL="${DINOV3_POOL:-patch_mean}"
-DINOV3_THIRD_PARTY_DIR="${DINOV3_THIRD_PARTY_DIR:-${POLICY_DIR}/map4d/backbone/model/vision/dinov3}"
+DINOV3_THIRD_PARTY_DIR="${DINOV3_THIRD_PARTY_DIR:-${POLICY_DIR}/third_party/dinov3}"
 TARGET_FORMAT="map4d_dit_local_delta_relative_rotation_v1"
 
 if [[ "${CONDA_DEFAULT_ENV:-}" != "4dmap" && "${RUNNING_IN_4DMAP:-0}" != "1" ]]; then
@@ -53,7 +58,8 @@ fi
 RAW_TASK="$1"
 DEMOS="$2"
 VISION_MODEL="${3,,}"
-RESOLUTION="${4,,}"
+RESOLUTION="${4:-224}"
+RESOLUTION="${RESOLUTION,,}"
 
 if [[ ! "$DEMOS" =~ ^[0-9]+$ || "$DEMOS" -le 0 ]]; then
   echo "Invalid demos=${DEMOS}. Use a positive integer." >&2
@@ -113,7 +119,7 @@ esac
 
 CONTROL_MODE="${CONTROL_MODE:-${DEFAULT_CONTROL_MODE}}"
 DATASET_DIR="${DATASET_DIR:-${DATA_ROOT}/ManiSkill/${TASK_NAME}/motionplanning}"
-FILTERED_DEMO_PATH="${DEMO_PATH:-${DATASET_DIR}/${TRAJ_NAME}.rgb.${CONTROL_MODE}.physx_cpu.filtered.h5}"
+FILTERED_DEMO_PATH="${DEMO_PATH:-${DATASET_DIR}/${TRAJ_NAME}.${OBS_MODE}.${CONTROL_MODE}.physx_cpu.filtered.h5}"
 
 case "$VISION_MODEL" in
   dino|dinov3)
@@ -145,12 +151,13 @@ if [[ "$SKIP_COLLECT" != "1" ]]; then
   echo "[$(date +%H:%M:%S)] Collecting ${DEMOS} ${TASK_NAME} demos"
   echo "  collector: ${COLLECT_SCRIPT}"
   echo "  max_steps: ${MAX_STEPS}"
-  echo "  stored_rgb_resolution: ${RESOLUTION}"
+  echo "  obs_mode: ${OBS_MODE}"
+  echo "  stored_image_resolution: ${RESOLUTION}"
   bash "$COLLECT_SCRIPT" "$DEMOS" "$NUM_PROCS" "$RESOLUTION"
 else
   echo "[$(date +%H:%M:%S)] SKIP_COLLECT=1; reusing filtered demo"
   if [[ "$RESOLUTION" != "native" ]]; then
-    echo "  note: existing demo RGB resolution is not changed; ${RESOLUTION} is applied during DINO feature extraction"
+    echo "  note: existing demo image resolution is not changed; ${RESOLUTION} is applied during DINO feature extraction"
   fi
 fi
 
@@ -207,11 +214,39 @@ if [[ "$VISION_MODEL" == dinov3_* ]]; then
   "${dinov3_cmd[@]}"
 
   RGB_FEATURE_DIM="$(
-    python -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d["trajectories"][0]["concat_shape"][-1])' \
+    python -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d["feature_dim"] if "feature_dim" in d else d["trajectories"][0]["concat_shape"][-1])' \
       "$FEATURE_SUMMARY_JSON"
   )"
 else
   echo "[$(date +%H:%M:%S)] vision_model=none; no obs/dino_feature will be generated"
+fi
+
+POINTCLOUD_SUMMARY_JSON=""
+if [[ "${BUILD_POINTCLOUD}" == "1" ]]; then
+  POINTCLOUD_SUMMARY_JSON="${POINTCLOUD_SUMMARY_JSON:-${TRAIN_DEMO_PATH%.h5}.pointcloud.summary.json}"
+  pointcloud_cmd=(
+    python "${POLICY_DIR}/scripts/data_collection/build_pointcloud_dataset.py"
+    --demo-path "${TRAIN_DEMO_PATH}"
+    --summary-json "${POINTCLOUD_SUMMARY_JSON}"
+    --task-name "${TASK_NAME}"
+    --cameras "${CAMERAS}"
+    --num-points "${POINTCLOUD_NUM_POINTS}"
+    --bbox "${POINTCLOUD_BBOX}"
+    --num-traj "${DEMOS}"
+    --seed "${POINTCLOUD_SEED}"
+    --in-place
+  )
+  if [[ "${OVERWRITE}" == "1" ]]; then
+    pointcloud_cmd+=(--overwrite)
+  fi
+
+  echo "[$(date +%H:%M:%S)] Building PPI-style point clouds"
+  echo "  train_demo: ${TRAIN_DEMO_PATH}"
+  echo "  cameras: ${CAMERAS}"
+  echo "  points: ${POINTCLOUD_NUM_POINTS}"
+  "${pointcloud_cmd[@]}"
+else
+  echo "[$(date +%H:%M:%S)] BUILD_POINTCLOUD=0; no obs/point_cloud will be generated"
 fi
 
 SIDECAR_PATH="${SIDECAR_PATH:-${TRAIN_DEMO_PATH%.h5}.map4d_dit_h${FUTURE_HORIZON}.h5}"
@@ -247,6 +282,7 @@ TASK_OVERRIDE=${TASK_OVERRIDE}
 VISION_MODEL=${VISION_MODEL}
 DINOV3_INPUT_RESOLUTION=${RESOLUTION}
 MANISKILL_RGB_RESOLUTION=${RESOLUTION}
+MANISKILL_OBS_MODE=${OBS_MODE}
 MAP4D_DEMO_PATH=${TRAIN_DEMO_PATH}
 MAP4D_KEYFRAME_SIDECAR_PATH=${SIDECAR_PATH}
 MAP4D_NUM_TRAJ=${DEMOS}
@@ -256,6 +292,10 @@ TARGET_FORMAT=${DIT_TARGET_FORMAT}
 USE_RGB=${USE_RGB}
 RGB_FEATURE_DIM=${RGB_FEATURE_DIM}
 FEATURE_SUMMARY_JSON=${FEATURE_SUMMARY_JSON}
+BUILD_POINTCLOUD=${BUILD_POINTCLOUD}
+POINTCLOUD_NUM_POINTS=${POINTCLOUD_NUM_POINTS}
+POINTCLOUD_BBOX=${POINTCLOUD_BBOX}
+POINTCLOUD_SUMMARY_JSON=${POINTCLOUD_SUMMARY_JSON}
 SIDECAR_SUMMARY_JSON=${SIDECAR_SUMMARY_JSON}
 EOF
 

@@ -9,6 +9,9 @@ keyframe_tcp_dim: 4
 eval_control_mode: pd_ee_delta_pos
 eval_max_episode_steps: 100
 eval_action_mode: pos_gripper
+control_mode: pd_ee_delta_pos
+max_episode_steps: 1000
+action_dim: 4
 
 dataset:
   _target_: map4d.backbone.dataset.maniskill_map4d_dataset.ManiSkillMap4DDataset

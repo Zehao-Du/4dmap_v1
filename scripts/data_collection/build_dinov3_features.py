@@ -3,11 +3,12 @@
 
 The default output is a compact sidecar HDF5:
 
-    traj_0/dino_feature                 [T, num_cameras * embed_dim]
+    traj_0/dino_feature/<camera>        [T, embed_dim]
     traj_0/dinov3/<camera>/patch_mean   [T, embed_dim]
 
-Use --embed-in-output-demo to copy the source demo and write obs/dino_feature
-inside each trajectory, which is directly readable by ManiSkillMap4DDataset.
+Use --embed-in-output-demo to copy the source demo and write
+obs/dino_feature/<camera> inside each trajectory, which is directly readable by
+ManiSkillMap4DDataset as separate camera tokens.
 """
 
 from __future__ import annotations
@@ -106,6 +107,7 @@ def _find_weights_path(model: str, explicit: Optional[str]) -> Path:
                 Path("/data2/zehao/models/DINOv3/DINOv3_ViT_LVD_1689M") / filename,
                 Path("/data2/zehao/models/dinov3") / filename,
                 Path("/data2/zehao/models/DINOv3") / filename,
+                Path("/inspire/hdd/project/robot-dna/baojiachun-CZXS25130063/zehao/foundation_models") / filename,
                 PROJECT_ROOT / "checkpoints" / "dinov3" / filename,
                 PROJECT_ROOT.parent / "checkpoints" / "dinov3" / filename,
                 Path("/data2/zehao/MAP4D/checkpoints/dinov3") / filename,
@@ -263,6 +265,14 @@ def _write_dataset(group: h5py.Group, name: str, value: np.ndarray, overwrite: b
     group.create_dataset(name, data=value, compression="gzip")
 
 
+def _require_group(parent: h5py.Group, name: str, overwrite: bool) -> h5py.Group:
+    if name in parent and isinstance(parent[name], h5py.Dataset):
+        if not overwrite:
+            raise FileExistsError(f"{parent.name}/{name} exists as a dataset. Pass --overwrite to replace it.")
+        del parent[name]
+    return parent.require_group(name)
+
+
 def _copy_h5_file(src: h5py.File, dst: h5py.File) -> None:
     for key, value in src.attrs.items():
         dst.attrs[key] = value
@@ -288,6 +298,7 @@ def build_dinov3_features(
     overwrite: bool,
     embed_in_output_demo: bool,
     in_place: bool,
+    concat_camera_features: bool,
 ) -> Dict[str, object]:
     if output_path.exists() and not overwrite and not in_place:
         raise FileExistsError(f"{output_path} exists. Pass --overwrite to replace it.")
@@ -372,29 +383,42 @@ def build_dinov3_features(
                     dinov3_group = traj_out.require_group("dinov3").require_group(camera_name)
                     _write_dataset(dinov3_group, pool, feature, overwrite=overwrite)
 
-                concat = np.concatenate(camera_features, axis=-1)
+                stacked = np.stack(camera_features, axis=1)
                 traj_out = f_out[traj_name] if traj_name in f_out else f_out.create_group(traj_name)
-                if embed_in_output_demo or in_place:
-                    obs_group = traj_out.require_group("obs")
-                    _write_dataset(obs_group, "dino_feature", concat, overwrite=overwrite)
+                if concat_camera_features:
+                    concat = np.concatenate(camera_features, axis=-1)
+                    if embed_in_output_demo or in_place:
+                        obs_group = traj_out.require_group("obs")
+                        _write_dataset(obs_group, "dino_feature", concat, overwrite=overwrite)
+                    else:
+                        _write_dataset(traj_out, "dino_feature", concat, overwrite=overwrite)
                 else:
-                    _write_dataset(traj_out, "dino_feature", concat, overwrite=overwrite)
+                    if embed_in_output_demo or in_place:
+                        feature_group = _require_group(traj_out.require_group("obs"), "dino_feature", overwrite)
+                    else:
+                        feature_group = _require_group(traj_out, "dino_feature", overwrite)
+                    for camera_name, feature in zip(camera_names, camera_features):
+                        _write_dataset(feature_group, camera_name, feature, overwrite=overwrite)
 
                 traj_out.attrs["dinov3_cameras"] = json.dumps(camera_names)
-                traj_out.attrs["dinov3_feature_dim"] = int(concat.shape[-1])
-                traj_out.attrs["dinov3_num_frames"] = int(concat.shape[0])
+                traj_out.attrs["dinov3_feature_dim"] = int(stacked.shape[-1])
+                traj_out.attrs["dinov3_num_cameras"] = int(stacked.shape[1])
+                traj_out.attrs["dinov3_num_frames"] = int(stacked.shape[0])
                 summary_rows.append(
                     {
                         "traj": traj_name,
-                        "num_frames": int(concat.shape[0]),
+                        "num_frames": int(stacked.shape[0]),
                         "cameras": camera_names,
                         "camera_feature_shapes": camera_shapes,
-                        "concat_shape": list(concat.shape),
+                        "feature_shape": list(stacked.shape),
+                        "concat_shape": list(np.concatenate(camera_features, axis=-1).shape)
+                        if concat_camera_features
+                        else None,
                     }
                 )
                 print(
-                    f"{traj_name}: frames={concat.shape[0]}, cameras={camera_names}, "
-                    f"dino_feature={tuple(concat.shape)}",
+                    f"{traj_name}: frames={stacked.shape[0]}, cameras={camera_names}, "
+                    f"dino_feature={tuple(stacked.shape)}",
                     flush=True,
                 )
         finally:
@@ -410,9 +434,11 @@ def build_dinov3_features(
         "third_party_dir": str(third_party_dir),
         "pool": pool,
         "embed_dim": embed_dim,
+        "feature_dim": embed_dim,
         "num_trajectories": len(summary_rows),
         "embed_in_output_demo": embed_in_output_demo,
         "in_place": in_place,
+        "concat_camera_features": concat_camera_features,
         "trajectories": summary_rows,
     }
 
@@ -448,12 +474,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--embed-in-output-demo",
         action="store_true",
-        help="Copy the full source demo and write traj/obs/dino_feature into the copy.",
+        help="Copy the full source demo and write per-camera traj/obs/dino_feature into the copy.",
     )
     parser.add_argument(
         "--in-place",
         action="store_true",
-        help="Write obs/dino_feature into --demo-path directly.",
+        help="Write per-camera obs/dino_feature into --demo-path directly.",
+    )
+    parser.add_argument(
+        "--concat-camera-features",
+        action="store_true",
+        help="Legacy mode: concatenate camera features into one [T, num_cameras * dim] dataset.",
     )
     return parser.parse_args()
 
@@ -510,6 +541,7 @@ def main() -> None:
         overwrite=args.overwrite,
         embed_in_output_demo=args.embed_in_output_demo,
         in_place=args.in_place,
+        concat_camera_features=args.concat_camera_features,
     )
 
     summary_path = (

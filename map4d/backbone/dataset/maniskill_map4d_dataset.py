@@ -99,6 +99,20 @@ def _quat_wxyz_to_rotation_6d_np(quat_wxyz: np.ndarray) -> np.ndarray:
     return matrix_to_rot6d_np(matrix)
 
 
+def _axis_angle_to_quaternion_np(axis_angle: np.ndarray) -> np.ndarray:
+    """Convert axis-angle to WXYZ quaternion. Zero vectors map to identity."""
+    angle = np.linalg.norm(axis_angle, axis=-1, keepdims=True).clip(min=1e-10)
+    half_angle = angle / 2.0
+    axis = axis_angle / angle
+    w = np.cos(half_angle)
+    xyz = axis * np.sin(half_angle)
+    quat = np.concatenate([w, xyz], axis=-1).astype(np.float32)
+    # For near-zero rotations, return identity
+    small = (angle < 1e-7).squeeze(-1)
+    quat[small] = [1.0, 0.0, 0.0, 0.0]
+    return quat
+
+
 def _actor_states_to_map4d_tensor(
     actor_states: Sequence[np.ndarray],
     *,
@@ -164,6 +178,29 @@ def _read_dataset(group: h5py.Group, path: str) -> Optional[np.ndarray]:
     if isinstance(node, h5py.Dataset):
         return node[()]
     return None
+
+
+def _read_feature_array(group: h5py.Group, path: str, pool: str = "patch_mean") -> Optional[np.ndarray]:
+    node = group
+    for part in path.split("/"):
+        if not isinstance(node, h5py.Group) or part not in node:
+            return None
+        node = node[part]
+    if isinstance(node, h5py.Dataset):
+        return node[()]
+    if not isinstance(node, h5py.Group):
+        return None
+
+    features = []
+    for key in sorted(node.keys()):
+        child = node[key]
+        if isinstance(child, h5py.Dataset):
+            features.append(child[()])
+        elif isinstance(child, h5py.Group) and pool in child and isinstance(child[pool], h5py.Dataset):
+            features.append(child[pool][()])
+    if not features:
+        return None
+    return np.stack(features, axis=1)
 
 
 def _flatten_time_array(value: np.ndarray, length: int) -> Optional[np.ndarray]:
@@ -306,12 +343,18 @@ class ManiSkillMap4DDataset(BaseDataset):
         feature = np.asarray(feature, dtype=np.float32)
         if feature.shape[0] != length:
             raise ValueError(f"rgb_feature length {feature.shape[0]} != expected {length}")
-        feature = feature.reshape(length, -1)
+        if feature.ndim == 1:
+            feature = feature.reshape(length, 1)
+        elif feature.ndim == 2:
+            pass
+        else:
+            feature = feature.reshape(length, *feature.shape[1:-1], feature.shape[-1])
         if feature.shape[-1] < self.rgb_feature_dim:
-            pad = np.zeros((length, self.rgb_feature_dim - feature.shape[-1]), dtype=np.float32)
+            pad_shape = (*feature.shape[:-1], self.rgb_feature_dim - feature.shape[-1])
+            pad = np.zeros(pad_shape, dtype=np.float32)
             feature = np.concatenate([feature, pad], axis=-1)
         elif feature.shape[-1] > self.rgb_feature_dim:
-            feature = feature[:, : self.rgb_feature_dim]
+            feature = feature[..., : self.rgb_feature_dim]
         return feature.astype(np.float32)
 
     def _rgb_to_stats_feature(self, rgb: np.ndarray, length: int) -> np.ndarray:
@@ -341,7 +384,7 @@ class ManiSkillMap4DDataset(BaseDataset):
                 if key in sidecar_record:
                     return self._format_rgb_feature(sidecar_record[key], length)
         for path in ("obs/rgb_feature", "obs/dino_feature", "rgb_feature", "dino_feature"):
-            value = _read_dataset(traj, path)
+            value = _read_feature_array(traj, path)
             if value is not None:
                 return self._format_rgb_feature(value, length)
         if self.allow_raw_rgb_stats_feature and "obs" in traj:
@@ -429,6 +472,13 @@ class ManiSkillMap4DDataset(BaseDataset):
         if actions.shape[-1] >= 8:
             trajectory = actions[:, :7]
             gripper = actions[:, -1:]
+        elif actions.shape[-1] == 7:
+            # pd_ee_delta_pose: (delta_pos[3], axis_angle[3], gripper[1])
+            trajectory = np.concatenate(
+                [actions[:, :3], _axis_angle_to_quaternion_np(actions[:, 3:6])],
+                axis=-1,
+            )
+            gripper = actions[:, 6:7]
         elif actions.shape[-1] == 4:
             identity = np.broadcast_to(
                 np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
@@ -438,7 +488,7 @@ class ManiSkillMap4DDataset(BaseDataset):
             gripper = actions[:, 3:4]
         else:
             raise ValueError(
-                f"Expected action dim >=8 or StackCube debug dim 4, got {actions.shape[-1]}"
+                f"Expected action dim >=8, 7, or 4, got {actions.shape[-1]}"
             )
         trajectory[:, 3:7] = canonicalize_quaternion_np(trajectory[:, 3:7])
         return np.concatenate([trajectory, gripper], axis=-1).astype(np.float32)
