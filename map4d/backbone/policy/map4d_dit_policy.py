@@ -29,7 +29,8 @@ class Map4DDiTPolicy(BasePolicy):
         num_inference_steps: Optional[int] = None,
         trajectory_loss_weight: float = 1.0,
         keyframe_tcp_loss_weight: float = 1.0,
-        keyframe_object_loss_weight: float = 0.3,
+        keyframe_map4d_loss_weight: Optional[float] = None,
+        keyframe_object_loss_weight: Optional[float] = None,
         gripper_loss_weight: float = 1.0,
     ):
         super().__init__()
@@ -59,10 +60,12 @@ class Map4DDiTPolicy(BasePolicy):
         self.n_action_steps = int(n_action_steps or action_horizon)
         self.n_obs_steps = int(n_obs_steps)
         self.num_inference_steps = int(num_inference_steps or noise_scheduler_cfg.num_train_timesteps)
+        if keyframe_map4d_loss_weight is None:
+            keyframe_map4d_loss_weight = 0.3 if keyframe_object_loss_weight is None else keyframe_object_loss_weight
         self.loss_weights = {
             "trajectory": float(trajectory_loss_weight),
             "keyframe_tcp": float(keyframe_tcp_loss_weight),
-            "keyframe_object": float(keyframe_object_loss_weight),
+            "keyframe_map4d": float(keyframe_map4d_loss_weight),
             "gripper": float(gripper_loss_weight),
         }
         self.normalizer = LinearNormalizer()
@@ -87,12 +90,6 @@ class Map4DDiTPolicy(BasePolicy):
         out = {key: value.to(device=self.device, dtype=self.dtype) for key, value in obs.items()}
         if "robot_state" in out:
             out["robot_state"] = self._normalize("robot_state", out["robot_state"])
-        if "map4d" in out and self._has_norm("map4d"):
-            out["map4d"] = self._normalize("map4d", out["map4d"])
-        if "size_parameters" in out and self._has_norm("size_parameters"):
-            out["size_parameters"] = self._normalize("size_parameters", out["size_parameters"])
-        if "relation_parameters" in out and self._has_norm("relation_parameters"):
-            out["relation_parameters"] = self._normalize("relation_parameters", out["relation_parameters"])
         return out
 
     def _normalize_targets(self, batch) -> Dict[str, torch.Tensor]:
@@ -100,8 +97,8 @@ class Map4DDiTPolicy(BasePolicy):
         trajectory[..., 0:3] = self._normalize("trajectory_pos", trajectory[..., 0:3])
         trajectory[..., 3:7] = normalize_quaternion(trajectory[..., 3:7])
 
-        keyframe_object = batch["keyframe"]["object"].clone()
-        keyframe_object[..., 0:3] = self._normalize("keyframe_object_pos", keyframe_object[..., 0:3])
+        keyframe_map4d = batch["keyframe"]["map4d"].clone()
+        keyframe_map4d[..., 0:3] = self._normalize("keyframe_map4d_pos", keyframe_map4d[..., 0:3])
 
         keyframe_tcp = batch["keyframe"]["tcp"].clone()
         keyframe_tcp[..., 0:3] = self._normalize("keyframe_tcp_pos", keyframe_tcp[..., 0:3])
@@ -118,7 +115,7 @@ class Map4DDiTPolicy(BasePolicy):
         gripper = self._normalize("gripper_openness", gripper)
         return {
             "trajectory": trajectory,
-            "keyframe_object": keyframe_object,
+            "keyframe_map4d": keyframe_map4d,
             "keyframe_tcp": keyframe_tcp,
             "gripper_openness": gripper,
         }
@@ -134,11 +131,11 @@ class Map4DDiTPolicy(BasePolicy):
 
     def _add_noise(self, targets: Dict[str, torch.Tensor], timesteps: torch.Tensor):
         trajectory = targets["trajectory"]
-        keyframe_object = targets["keyframe_object"]
+        keyframe_map4d = targets["keyframe_map4d"]
         keyframe_tcp = targets["keyframe_tcp"]
         noise = {
             "trajectory": torch.randn_like(trajectory),
-            "keyframe_object": torch.randn_like(keyframe_object),
+            "keyframe_map4d": torch.randn_like(keyframe_map4d),
             "keyframe_tcp": torch.randn_like(keyframe_tcp),
         }
 
@@ -155,13 +152,13 @@ class Map4DDiTPolicy(BasePolicy):
             ],
             dim=-1,
         )
-        noisy_object = torch.cat(
+        noisy_map4d = torch.cat(
             [
                 self.position_noise_scheduler.add_noise(
-                    keyframe_object[..., 0:3], noise["keyframe_object"][..., 0:3], timesteps
+                    keyframe_map4d[..., 0:3], noise["keyframe_map4d"][..., 0:3], timesteps
                 ),
                 self.rotation_noise_scheduler.add_noise(
-                    keyframe_object[..., 3:9], noise["keyframe_object"][..., 3:9], timesteps
+                    keyframe_map4d[..., 3:9], noise["keyframe_map4d"][..., 3:9], timesteps
                 ),
             ],
             dim=-1,
@@ -184,7 +181,7 @@ class Map4DDiTPolicy(BasePolicy):
         noisy_tcp = torch.cat([tcp_pos, tcp_tail], dim=-1)
         noisy = {
             "trajectory": noisy_trajectory,
-            "keyframe_object": noisy_object,
+            "keyframe_map4d": noisy_map4d,
             "keyframe_tcp": noisy_tcp,
         }
         return noisy, noise
@@ -205,19 +202,19 @@ class Map4DDiTPolicy(BasePolicy):
 
         trajectory_loss = F.l1_loss(pred["trajectory"], noise["trajectory"])
         keyframe_tcp_loss = F.l1_loss(pred["keyframe_tcp"], noise["keyframe_tcp"])
-        keyframe_object_loss = F.l1_loss(pred["keyframe_object"], noise["keyframe_object"])
+        keyframe_map4d_loss = F.l1_loss(pred["keyframe_map4d"], noise["keyframe_map4d"])
         gripper_loss = F.l1_loss(pred["gripper_openness"], targets["gripper_openness"])
         total_loss = (
             self.loss_weights["trajectory"] * trajectory_loss
             + self.loss_weights["keyframe_tcp"] * keyframe_tcp_loss
-            + self.loss_weights["keyframe_object"] * keyframe_object_loss
+            + self.loss_weights["keyframe_map4d"] * keyframe_map4d_loss
             + self.loss_weights["gripper"] * gripper_loss
         )
         return total_loss, {
             "bc_loss": float(total_loss.detach().cpu()),
             "trajectory_noise_l1": float(trajectory_loss.detach().cpu()),
             "keyframe_tcp_noise_l1": float(keyframe_tcp_loss.detach().cpu()),
-            "keyframe_object_noise_l1": float(keyframe_object_loss.detach().cpu()),
+            "keyframe_map4d_noise_l1": float(keyframe_map4d_loss.detach().cpu()),
             "gripper_l1": float(gripper_loss.detach().cpu()),
         }
 
@@ -228,11 +225,11 @@ class Map4DDiTPolicy(BasePolicy):
         trajectory_quat = self.rotation_noise_scheduler.step(
             pred["trajectory"][..., 3:7], t, sample["trajectory"][..., 3:7]
         ).prev_sample
-        object_pos = self.position_noise_scheduler.step(
-            pred["keyframe_object"][..., 0:3], t, sample["keyframe_object"][..., 0:3]
+        map4d_pos = self.position_noise_scheduler.step(
+            pred["keyframe_map4d"][..., 0:3], t, sample["keyframe_map4d"][..., 0:3]
         ).prev_sample
-        object_rot = self.rotation_noise_scheduler.step(
-            pred["keyframe_object"][..., 3:9], t, sample["keyframe_object"][..., 3:9]
+        map4d_rot = self.rotation_noise_scheduler.step(
+            pred["keyframe_map4d"][..., 3:9], t, sample["keyframe_map4d"][..., 3:9]
         ).prev_sample
         tcp_pos = self.position_noise_scheduler.step(
             pred["keyframe_tcp"][..., 0:3], t, sample["keyframe_tcp"][..., 0:3]
@@ -251,7 +248,7 @@ class Map4DDiTPolicy(BasePolicy):
             raise ValueError(f"Unsupported keyframe TCP dim {sample['keyframe_tcp'].shape[-1]}")
         return {
             "trajectory": torch.cat([trajectory_pos, normalize_quaternion(trajectory_quat)], dim=-1),
-            "keyframe_object": torch.cat([object_pos, object_rot], dim=-1),
+            "keyframe_map4d": torch.cat([map4d_pos, map4d_rot], dim=-1),
             "keyframe_tcp": torch.cat([tcp_pos, tcp_tail], dim=-1),
         }
 
@@ -262,12 +259,18 @@ class Map4DDiTPolicy(BasePolicy):
         batch_size = value.shape[0]
         device = self.device
         dtype = self.dtype
+        num_arms = int(getattr(self.model, "num_arms", 1))
+
+        if num_arms == 1:
+            trajectory_shape = (batch_size, self.action_horizon, 7)
+            tcp_shape = (batch_size, self.keyframe_horizon, self.model.tcp_dim)
+        else:
+            trajectory_shape = (batch_size, num_arms, self.action_horizon, 7)
+            tcp_shape = (batch_size, num_arms, self.keyframe_horizon, self.model.tcp_dim)
 
         sample = {
-            "trajectory": torch.randn(
-                batch_size, self.action_horizon, 7, device=device, dtype=dtype
-            ),
-            "keyframe_object": torch.randn(
+            "trajectory": torch.randn(*trajectory_shape, device=device, dtype=dtype),
+            "keyframe_map4d": torch.randn(
                 batch_size,
                 self.keyframe_horizon,
                 self.model.num_objects,
@@ -275,13 +278,7 @@ class Map4DDiTPolicy(BasePolicy):
                 device=device,
                 dtype=dtype,
             ),
-            "keyframe_tcp": torch.randn(
-                batch_size,
-                self.keyframe_horizon,
-                self.model.tcp_dim,
-                device=device,
-                dtype=dtype,
-            ),
+            "keyframe_tcp": torch.randn(*tcp_shape, device=device, dtype=dtype),
         }
         sample["trajectory"][..., 3:7] = normalize_quaternion(sample["trajectory"][..., 3:7])
         if self.model.tcp_dim == 7:
@@ -298,12 +295,15 @@ class Map4DDiTPolicy(BasePolicy):
         trajectory_pred = self._unnormalize_trajectory(sample["trajectory"])
         gripper_pred = self._unnormalize_gripper(latest_pred["gripper_openness"])
         action_pred = torch.cat([trajectory_pred, gripper_pred], dim=-1)
-        action = action_pred[:, : self.n_action_steps]
+        if num_arms == 1:
+            action = action_pred[:, : self.n_action_steps]
+        else:
+            action = action_pred[:, :, : self.n_action_steps]
         return {
             "action": action,
             "action_pred": action_pred,
             "trajectory_pred": trajectory_pred,
             "gripper_openness_pred": gripper_pred,
-            "keyframe_object_latent": sample["keyframe_object"],
+            "keyframe_map4d_latent": sample["keyframe_map4d"],
             "keyframe_tcp_latent": sample["keyframe_tcp"],
         }

@@ -17,8 +17,12 @@ horizon_action: 50
 horizon_keyframe: 4
 n_obs_steps: 2
 n_action_steps: 50
-num_objects: ${task.num_objects}
+num_objects: ${map4d_meta:${task.name},num_objects}
 robot_state_dim: ${task.robot_state_dim}
+map4d_dim: ${map4d_meta:${task.name},map4d_dim}
+size_parameter_dim: ${map4d_meta:${task.name},size_parameter_dim}
+relation_parameter_dim: ${map4d_meta:${task.name},relation_parameter_dim}
+num_map_nodes: ${map4d_meta:${task.name},num_map_nodes}
 
 policy:
   _target_: map4d.backbone.policy.map4d_dit_policy.Map4DDiTPolicy
@@ -28,7 +32,7 @@ policy:
   n_obs_steps: ${n_obs_steps}
   trajectory_loss_weight: 1.0
   keyframe_tcp_loss_weight: 1.0
-  keyframe_object_loss_weight: 0.3
+  keyframe_map4d_loss_weight: 0.3
   gripper_loss_weight: 1.0
   noise_scheduler_cfg:
     num_train_timesteps: 1000
@@ -39,19 +43,27 @@ policy:
   model_cfg:
     robot_state_dim: ${robot_state_dim}
     num_objects: ${num_objects}
-    map4d_dim: ${task.map4d_dim}
-    size_parameter_dim: ${task.size_parameter_dim}
-    relation_parameter_dim: ${task.relation_parameter_dim}
+    map4d_dim: ${map4d_dim}
+    size_parameter_dim: ${size_parameter_dim}
+    relation_parameter_dim: ${relation_parameter_dim}
     tcp_dim: ${task.keyframe_tcp_dim}
     rgb_feature_dim: 288
-    embed_dim: 288
+    semantic_feature_dim: 288
+    map_feature_dim: 240
+    n_map_step: ${n_obs_steps}
+    num_map_nodes: ${num_map_nodes}
+    use_map_encoder: true
+    map_name: ${task.name}
+    map_encoder_num_layers: 4
+    map_encoder_num_heads: 8
+    embed_dim: 240
     depth: 8
     num_heads: 8
     mlp_ratio: 4.0
     dropout: 0.0
-    diffusion_step_embed_dim: 288
+    diffusion_step_embed_dim: 240
     use_rgb: true
-    max_context_tokens: 1024
+    max_context_tokens: 20000
 
 ema:
   _target_: map4d.backbone.model.diffusion.ema_model.EMAModel

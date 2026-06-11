@@ -6,6 +6,8 @@ trajectories and writes:
 
     traj_*/obs/point_cloud/<camera>     [T, points_per_camera, 6]  xyzrgb
     traj_*/obs/point_cloud/fused        [T, num_points, 6]         xyzrgb
+    traj_*/obs/point_cloud_source/fused/camera_index [T, num_points]
+    traj_*/obs/point_cloud_source/fused/pixel_uv     [T, num_points, 2]
     traj_*/obs/tcp_trajectory/pose      [T, 7]
     traj_*/obs/tcp_trajectory/pos       [T, 3]
 
@@ -158,27 +160,32 @@ def _pointcloud_from_depth(
 
 def _sample_points(
     xyzrgb: np.ndarray,
+    pixel_uv: np.ndarray,
     num_points: int,
     bbox_min: np.ndarray,
     bbox_max: np.ndarray,
     rng: np.random.Generator,
-) -> Tuple[np.ndarray, bool]:
+) -> Tuple[np.ndarray, np.ndarray, bool]:
     xyz = xyzrgb[:, :3]
     valid = np.isfinite(xyz).all(axis=1)
     valid &= xyz[:, 2] > bbox_min[2]
     inside = valid & np.all((xyz >= bbox_min) & (xyz <= bbox_max), axis=1)
-    candidates = xyzrgb[inside]
+    candidate_indices = np.flatnonzero(inside)
     used_fallback = False
 
-    if len(candidates) == 0:
-        candidates = xyzrgb[valid]
+    if len(candidate_indices) == 0:
+        candidate_indices = np.flatnonzero(valid)
         used_fallback = True
-    if len(candidates) == 0:
+    if len(candidate_indices) == 0:
         raise ValueError("No valid depth points available for point cloud sampling.")
 
-    replace = len(candidates) < num_points
-    indices = rng.choice(len(candidates), size=num_points, replace=replace)
-    return candidates[indices].astype(np.float32), used_fallback or replace
+    replace = len(candidate_indices) < num_points
+    sampled_indices = rng.choice(candidate_indices, size=num_points, replace=replace)
+    return (
+        xyzrgb[sampled_indices].astype(np.float32),
+        pixel_uv[sampled_indices].astype(np.int32),
+        used_fallback or replace,
+    )
 
 
 def _points_per_camera(total: int, num_cameras: int) -> List[int]:
@@ -194,15 +201,27 @@ def _build_traj_pointcloud(
     bbox_min: np.ndarray,
     bbox_max: np.ndarray,
     seed: int,
-) -> Tuple[Dict[str, np.ndarray], np.ndarray, Dict[str, int]]:
+) -> Tuple[
+    Dict[str, np.ndarray],
+    np.ndarray,
+    Dict[str, Dict[str, np.ndarray]],
+    Dict[str, np.ndarray],
+    Dict[str, int],
+]:
     per_camera_counts = _points_per_camera(num_points, len(cameras))
     per_camera_clouds: Dict[str, List[np.ndarray]] = {camera: [] for camera in cameras}
+    per_camera_pixels: Dict[str, List[np.ndarray]] = {camera: [] for camera in cameras}
+    per_camera_indices: Dict[str, List[np.ndarray]] = {camera: [] for camera in cameras}
     fused_frames: List[np.ndarray] = []
+    fused_pixel_frames: List[np.ndarray] = []
+    fused_camera_index_frames: List[np.ndarray] = []
     fallback_counts = {camera: 0 for camera in cameras}
 
     num_frames = traj["obs"]["sensor_data"][cameras[0]]["rgb"].shape[0]
     for frame_idx in range(num_frames):
         frame_clouds = []
+        frame_pixels = []
+        frame_camera_indices = []
         for camera_idx, (camera, camera_points) in enumerate(zip(cameras, per_camera_counts)):
             rgb = traj["obs"]["sensor_data"][camera]["rgb"][frame_idx]
             depth = traj["obs"]["sensor_data"][camera]["depth"][frame_idx]
@@ -211,23 +230,53 @@ def _build_traj_pointcloud(
 
             depth_m = _depth_to_meters(depth)
             xyz = _pointcloud_from_depth(depth_m, intrinsic, extrinsic)
+            height, width = depth_m.shape
+            u = np.tile(np.arange(width, dtype=np.int32), (height, 1))
+            v = np.tile(np.arange(height, dtype=np.int32)[:, None], (1, width))
+            pixel_uv = np.stack((u, v), axis=-1).reshape(-1, 2)
             rgb_flat = rgb.reshape(-1, 3).astype(np.float32)
             xyzrgb = np.concatenate([xyz, rgb_flat], axis=1)
 
             rng = np.random.default_rng(seed + frame_idx * 9973 + camera_idx * 101)
-            sampled, fallback = _sample_points(xyzrgb, camera_points, bbox_min, bbox_max, rng)
+            sampled, sampled_pixel_uv, fallback = _sample_points(
+                xyzrgb,
+                pixel_uv,
+                camera_points,
+                bbox_min,
+                bbox_max,
+                rng,
+            )
             if fallback:
                 fallback_counts[camera] += 1
             per_camera_clouds[camera].append(sampled)
+            per_camera_pixels[camera].append(sampled_pixel_uv)
+            per_camera_indices[camera].append(
+                np.full((sampled.shape[0],), camera_idx, dtype=np.int16)
+            )
             frame_clouds.append(sampled)
+            frame_pixels.append(sampled_pixel_uv)
+            frame_camera_indices.append(per_camera_indices[camera][-1])
         fused_frames.append(np.concatenate(frame_clouds, axis=0).astype(np.float32))
+        fused_pixel_frames.append(np.concatenate(frame_pixels, axis=0).astype(np.int32))
+        fused_camera_index_frames.append(np.concatenate(frame_camera_indices, axis=0).astype(np.int16))
 
     per_camera_arrays = {
         camera: np.stack(frames, axis=0).astype(np.float32)
         for camera, frames in per_camera_clouds.items()
     }
+    per_camera_sources = {
+        camera: {
+            "pixel_uv": np.stack(per_camera_pixels[camera], axis=0).astype(np.int32),
+            "camera_index": np.stack(per_camera_indices[camera], axis=0).astype(np.int16),
+        }
+        for camera in cameras
+    }
     fused = np.stack(fused_frames, axis=0).astype(np.float32)
-    return per_camera_arrays, fused, fallback_counts
+    fused_source = {
+        "pixel_uv": np.stack(fused_pixel_frames, axis=0).astype(np.int32),
+        "camera_index": np.stack(fused_camera_index_frames, axis=0).astype(np.int16),
+    }
+    return per_camera_arrays, fused, per_camera_sources, fused_source, fallback_counts
 
 
 def build_pointcloud_dataset(
@@ -274,7 +323,7 @@ def build_pointcloud_dataset(
                 traj_in = f_in[traj_name]
                 traj_out = f_out[traj_name]
                 camera_names = _discover_cameras(traj_in, cameras)
-                per_camera, fused, fallback_counts = _build_traj_pointcloud(
+                per_camera, fused, per_camera_sources, fused_source, fallback_counts = _build_traj_pointcloud(
                     traj_in,
                     camera_names,
                     num_points,
@@ -288,6 +337,30 @@ def build_pointcloud_dataset(
                 for camera_name in camera_names:
                     _write_dataset(pointcloud_group, camera_name, per_camera[camera_name], overwrite)
                 _write_dataset(pointcloud_group, "fused", fused, overwrite)
+
+                source_group = _require_clean_group(obs_out, "point_cloud_source", overwrite)
+                fused_source_group = _require_clean_group(source_group, "fused", overwrite)
+                _write_dataset(
+                    fused_source_group,
+                    "camera_index",
+                    fused_source["camera_index"],
+                    overwrite,
+                )
+                _write_dataset(fused_source_group, "pixel_uv", fused_source["pixel_uv"], overwrite)
+                for camera_name in camera_names:
+                    camera_source_group = _require_clean_group(source_group, camera_name, overwrite)
+                    _write_dataset(
+                        camera_source_group,
+                        "camera_index",
+                        per_camera_sources[camera_name]["camera_index"],
+                        overwrite,
+                    )
+                    _write_dataset(
+                        camera_source_group,
+                        "pixel_uv",
+                        per_camera_sources[camera_name]["pixel_uv"],
+                        overwrite,
+                    )
 
                 tcp_pose = traj_in["obs"]["extra"]["tcp_pose"][()].astype(np.float32)
                 tcp_group = _require_clean_group(obs_out, "tcp_trajectory", overwrite)
@@ -305,6 +378,8 @@ def build_pointcloud_dataset(
                             camera: list(per_camera[camera].shape) for camera in camera_names
                         },
                         "fused_shape": list(fused.shape),
+                        "fused_camera_index_shape": list(fused_source["camera_index"].shape),
+                        "fused_pixel_uv_shape": list(fused_source["pixel_uv"].shape),
                         "tcp_pose_shape": list(tcp_pose.shape),
                         "fallback_counts": fallback_counts,
                     }

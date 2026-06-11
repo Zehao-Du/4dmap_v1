@@ -258,17 +258,16 @@ def evaluate_maniskill(
                 "robot_state": torch.from_numpy(
                     np.stack(obs_batch["robot_state"])
                 ).float().unsqueeze(1).expand(-1, n_obs_steps, -1).to(device),
-                "map4d": torch.from_numpy(
+                "node_poses": torch.from_numpy(
                     np.stack(obs_batch["map4d"])
                 ).float().to(device),
                 "size_parameters": torch.from_numpy(
                     np.tile(size_params, (num_eval_envs, 1))
                 ).float().to(device),
-            }
-            if relation_parameter_dim > 0:
-                obs_dict["relation_parameters"] = torch.from_numpy(
+                "relation_parameters": torch.from_numpy(
                     np.tile(relation_params, (num_eval_envs, 1))
-                ).float().to(device)
+                ).float().to(device),
+            }
             if use_rgb:
                 obs_dict["rgb_feature"] = torch.zeros(
                     num_eval_envs, n_obs_steps, rgb_feature_dim, device=device

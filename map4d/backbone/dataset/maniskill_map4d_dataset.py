@@ -180,6 +180,49 @@ def _read_dataset(group: h5py.Group, path: str) -> Optional[np.ndarray]:
     return None
 
 
+def _get_dataset_node(group: h5py.Group, path: str) -> Optional[h5py.Dataset]:
+    node = group
+    for part in path.split("/"):
+        if not isinstance(node, h5py.Group) or part not in node:
+            return None
+        node = node[part]
+    if isinstance(node, h5py.Dataset):
+        return node
+    return None
+
+
+def _decode_h5_attr(value) -> str:
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
+
+
+def _require_dino_provenance(traj_name: str, feature: h5py.Dataset) -> None:
+    flattened = {}
+    for node in (feature.file, feature.parent, feature, feature.parent.parent):
+        if node is None:
+            continue
+        for key, value in node.attrs.items():
+            flattened[str(key)] = _decode_h5_attr(value)
+
+    for key, value in flattened.items():
+        if key in {"semantic_feature_mode", "semantic_feature_source"} and value.lower() in {
+            "rgb",
+            "pointcloud_rgb",
+            "rgb_placeholder",
+        }:
+            raise ValueError(
+                f"{traj_name}: {feature.name} was produced by {key}={value!r}, not a DINO model"
+            )
+
+    provenance_text = " ".join(f"{key}={value}" for key, value in flattened.items()).lower()
+    if "dino" not in provenance_text:
+        raise ValueError(
+            f"{traj_name}: {feature.name} is missing DINO provenance metadata. "
+            "Expected attrs such as semantic_feature_model=dinov3_* or feature_type=dinov3."
+        )
+
+
 def _read_feature_array(group: h5py.Group, path: str, pool: str = "patch_mean") -> Optional[np.ndarray]:
     node = group
     for part in path.split("/"):
@@ -237,6 +280,10 @@ class ManiSkillMap4DDataset(BaseDataset):
         use_rgb: bool = True,
         use_depth: bool = False,
         rgb_feature_dim: int = 288,
+        semantic_feature_dim: Optional[int] = None,
+        map_feature_dim: int = 240,
+        pointcloud_path: str = "obs/point_cloud/fused",
+        dino_feature_path: str = "obs/dino_feature",
         keyframe_tcp_dim: Optional[int] = None,
         allow_missing_rgb_feature: bool = False,
         allow_raw_rgb_stats_feature: bool = False,
@@ -264,6 +311,12 @@ class ManiSkillMap4DDataset(BaseDataset):
         self.use_rgb = bool(use_rgb)
         self.use_depth = bool(use_depth)
         self.rgb_feature_dim = int(rgb_feature_dim)
+        self.semantic_feature_dim = (
+            None if semantic_feature_dim is None else int(semantic_feature_dim)
+        )
+        self.map_feature_dim = int(map_feature_dim)
+        self.pointcloud_path = str(pointcloud_path)
+        self.dino_feature_path = str(dino_feature_path)
         self.keyframe_tcp_dim = None if keyframe_tcp_dim is None else int(keyframe_tcp_dim)
         self.allow_missing_rgb_feature = bool(allow_missing_rgb_feature)
         self.allow_raw_rgb_stats_feature = bool(allow_raw_rgb_stats_feature)
@@ -336,8 +389,49 @@ class ManiSkillMap4DDataset(BaseDataset):
                 record["rgb_feature"] = rng.normal(
                     scale=0.1, size=(length + 1, self.rgb_feature_dim)
                 ).astype(np.float32)
+                point_count = 128
+                record["point_cloud"] = rng.normal(
+                    scale=0.1, size=(length + 1, point_count, 6)
+                ).astype(np.float32)
+                semantic_dim = self.semantic_feature_dim or self.rgb_feature_dim
+                record["dino_feature"] = rng.normal(
+                    scale=0.1, size=(length + 1, point_count, semantic_dim)
+                ).astype(np.float32)
             trajectories.append(record)
         return trajectories
+
+    def _load_point_cloud(self, traj: h5py.Group, length: int) -> np.ndarray:
+        point_cloud = _read_dataset(traj, self.pointcloud_path)
+        if point_cloud is None:
+            raise KeyError(f"{traj.name} missing {self.pointcloud_path}")
+        point_cloud = np.asarray(point_cloud, dtype=np.float32)
+        if point_cloud.ndim != 3 or point_cloud.shape[0] != length or point_cloud.shape[-1] < 3:
+            raise ValueError(
+                f"{traj.name}/{self.pointcloud_path} must be [T,P,>=3] with T={length}, "
+                f"got {point_cloud.shape}"
+            )
+        return point_cloud
+
+    def _load_dino_feature(self, traj: h5py.Group, length: int, point_count: int) -> np.ndarray:
+        dino_node = _get_dataset_node(traj, self.dino_feature_path)
+        if dino_node is None:
+            raise KeyError(f"{traj.name} missing {self.dino_feature_path}")
+        _require_dino_provenance(traj.name, dino_node)
+        dino_feature = dino_node[()]
+        dino_feature = np.asarray(dino_feature, dtype=np.float32)
+        if dino_feature.ndim != 3:
+            raise ValueError(f"{traj.name}/{self.dino_feature_path} must be [T,P,D], got {dino_feature.shape}")
+        if dino_feature.shape[:2] != (length, point_count):
+            raise ValueError(
+                f"{traj.name}: point_cloud and dino_feature must share [T,P], "
+                f"got {(length, point_count)} and {dino_feature.shape[:2]}"
+            )
+        if self.semantic_feature_dim is not None and dino_feature.shape[-1] != self.semantic_feature_dim:
+            raise ValueError(
+                f"{traj.name}: expected semantic_feature_dim={self.semantic_feature_dim}, "
+                f"got {dino_feature.shape[-1]}"
+            )
+        return dino_feature
 
     def _format_rgb_feature(self, feature: np.ndarray, length: int) -> np.ndarray:
         feature = np.asarray(feature, dtype=np.float32)
@@ -447,15 +541,14 @@ class ManiSkillMap4DDataset(BaseDataset):
         return _actor_states_to_map4d_tensor(actor_states, sizes=sizes)
 
     def _load_structural_parameters(self, sidecar_record=None):
-        default_size, default_relation = _task_parameters(self.task_name)
-        if sidecar_record is not None and "size_parameters" in sidecar_record:
-            size_parameters = np.asarray(sidecar_record["size_parameters"], dtype=np.float32).reshape(-1)
-        else:
-            size_parameters = default_size
-        if sidecar_record is not None and "relation_parameters" in sidecar_record:
-            relation_parameters = np.asarray(sidecar_record["relation_parameters"], dtype=np.float32).reshape(-1)
-        else:
-            relation_parameters = default_relation
+        if sidecar_record is None:
+            raise ValueError("keyframe_sidecar_path is required to load size_parameters/relation_parameters")
+        if "size_parameters" not in sidecar_record:
+            raise KeyError("Sidecar record missing size_parameters")
+        if "relation_parameters" not in sidecar_record:
+            raise KeyError("Sidecar record missing relation_parameters")
+        size_parameters = np.asarray(sidecar_record["size_parameters"], dtype=np.float32).reshape(-1)
+        relation_parameters = np.asarray(sidecar_record["relation_parameters"], dtype=np.float32).reshape(-1)
         if size_parameters.shape[0] != self.size_parameter_dim:
             raise ValueError(
                 f"Expected size_parameter_dim={self.size_parameter_dim}, got {size_parameters.shape[0]}"
@@ -555,12 +648,11 @@ class ManiSkillMap4DDataset(BaseDataset):
                     sidecar[traj_name] if sidecar is not None else None
                 )
                 rgb_feature = None
+                point_cloud = None
+                dino_feature = None
                 if self.use_rgb:
-                    rgb_feature = self._load_rgb_feature(
-                        traj,
-                        seq_len,
-                        sidecar[traj_name] if sidecar is not None else None,
-                    )
+                    point_cloud = self._load_point_cloud(traj, seq_len)
+                    dino_feature = self._load_dino_feature(traj, seq_len, point_cloud.shape[1])
 
                 if sidecar is None:
                     keyframes = np.arange(seq_len, dtype=np.int64)
@@ -603,6 +695,10 @@ class ManiSkillMap4DDataset(BaseDataset):
                 }
                 if rgb_feature is not None:
                     record["rgb_feature"] = rgb_feature.astype(np.float32)
+                if point_cloud is not None:
+                    record["point_cloud"] = point_cloud.astype(np.float32)
+                if dino_feature is not None:
+                    record["dino_feature"] = dino_feature.astype(np.float32)
                 trajectories.append(record)
         if not trajectories:
             raise ValueError(f"No traj_* groups found in {demo_path}")
@@ -637,11 +733,11 @@ class ManiSkillMap4DDataset(BaseDataset):
     def get_normalizer(self, mode="limits", **kwargs) -> LinearNormalizer:
         normalizer = LinearNormalizer()
         robot_state = np.concatenate([traj["robot_state"] for traj in self.trajectories], axis=0)
-        map4d = np.concatenate([traj["map4d"] for traj in self.trajectories], axis=0)
+        node_poses = np.concatenate([traj["map4d"] for traj in self.trajectories], axis=0)
         size_parameters = np.stack([traj["size_parameters"] for traj in self.trajectories], axis=0)
         trajectory_pos = np.concatenate([traj["actions"][:, 0:3] for traj in self.trajectories], axis=0)
         gripper = np.concatenate([traj["actions"][:, 7:8] for traj in self.trajectories], axis=0)
-        keyframe_object_pos = np.concatenate(
+        keyframe_map4d_pos = np.concatenate(
             [traj["keyframe_object"][..., 0:3].reshape(-1, 3) for traj in self.trajectories],
             axis=0,
         )
@@ -651,11 +747,11 @@ class ManiSkillMap4DDataset(BaseDataset):
         )
         fields = {
             "robot_state": robot_state,
-            "map4d": map4d,
+            "node_poses": node_poses,
             "size_parameters": size_parameters,
             "trajectory_pos": trajectory_pos,
             "gripper_openness": gripper,
-            "keyframe_object_pos": keyframe_object_pos,
+            "keyframe_map4d_pos": keyframe_map4d_pos,
             "keyframe_tcp_pos": keyframe_tcp_pos,
         }
         if self.trajectories[0]["keyframe_tcp"].shape[-1] == 4:
@@ -696,7 +792,7 @@ class ManiSkillMap4DDataset(BaseDataset):
         sample = {
             "obs": {
                 "robot_state": self._slice_with_pad(traj["robot_state"], obs_start, self.n_obs_steps),
-                "map4d": self._slice_with_pad(traj["map4d"], obs_start, self.n_obs_steps),
+                "node_poses": self._slice_with_pad(traj["map4d"], obs_start, self.n_obs_steps),
                 "size_parameters": traj["size_parameters"],
                 "relation_parameters": traj["relation_parameters"],
             },
@@ -705,13 +801,20 @@ class ManiSkillMap4DDataset(BaseDataset):
                 "gripper_openness": action_seq[:, 7:8],
             },
             "keyframe": {
-                "object": traj["keyframe_object"][current_idx, : self.horizon_keyframe],
+                "map4d": traj["keyframe_object"][current_idx, : self.horizon_keyframe],
                 "tcp": traj["keyframe_tcp"][current_idx, : self.horizon_keyframe],
             },
         }
-        if self.use_rgb:
+        if self.use_rgb and "rgb_feature" in traj:
             sample["obs"]["rgb_feature"] = self._slice_with_pad(
                 traj["rgb_feature"], obs_start, self.n_obs_steps
+            )
+        if self.use_rgb:
+            sample["obs"]["point_cloud"] = self._slice_with_pad(
+                traj["point_cloud"], obs_start, self.n_obs_steps
+            )
+            sample["obs"]["dino_feature"] = self._slice_with_pad(
+                traj["dino_feature"], obs_start, self.n_obs_steps
             )
         return _to_tensor_tree(sample)
 

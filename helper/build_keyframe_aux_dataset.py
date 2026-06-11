@@ -8,6 +8,7 @@ per-frame map4d tensors, TCP targets, and optionally materialized training targe
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 import json
 import os
 import sys
@@ -25,7 +26,6 @@ import numpy as np
 from map4d.representation.maps4d.metadata import (
     TASK_METADATA_FILES,
     get_task_actor_names,
-    get_task_parameter_defaults,
 )
 
 try:
@@ -55,66 +55,11 @@ TASK_ACTOR_NAMES = {
     "PlugCharger-v1": ("charger", "receptacle"),
 }
 
-TASK_GT_SIZES = {
-    "StackCube-v1": (
-        0.04,
-        0.04,
-        0.04,
-        0.04,
-        0.04,
-        0.04,
-        1.2090764,
-        2.4178784,
-        0.91964292762787,
-    ),
-    "PlugCharger-v1": (
-        0.04,
-        0.03,
-        0.024,
-        0.02,
-        0.1,
-        0.1,
-    ),
-}
-
-TASK_SIZE_PARAMETER_DEFAULTS = {
-    # Map4d_StackCube: red cube(3) + green cube(3) + desk(3)
-    "StackCube-v1": (
-        0.04,
-        0.04,
-        0.04,
-        0.04,
-        0.04,
-        0.04,
-        1.2090764,
-        2.4178784,
-        0.91964292762787,
-    ),
-    # Map4d_PlugCharger: charger body(3) + charger prong(3) + receptacle(8).
-    # Receptacle decomposes into center-divider(3) + face-loop(5).
-    "PlugCharger-v1": (
-        0.04,
-        0.03,
-        0.024,
-        0.016,
-        0.0015,
-        0.0064,
-        0.02,
-        0.004,
-        0.04,
-        0.004,
-        0.045,
-        0.025,
-        0.1,
-        0.1,
-    ),
-}
-
-TASK_RELATION_PARAMETER_DEFAULTS = {
-    "StackCube-v1": tuple(),
-    # Map4d_PlugCharger: half-gap between two charger prongs.
-    "PlugCharger-v1": (0.007,),
-}
+@dataclass(frozen=True)
+class StructuralParameters:
+    size_parameters: np.ndarray
+    relation_parameters: np.ndarray
+    actor_sizes: np.ndarray
 
 
 def _traj_sort_key(name: str) -> int:
@@ -228,24 +173,185 @@ def _load_pose_map4d_from_traj(
     return _actor_states_to_pose_map4d_tensor(actor_states)
 
 
-def _task_parameters(task_name: str) -> Tuple[np.ndarray, np.ndarray]:
-    try:
-        size_defaults, relation_defaults = get_task_parameter_defaults(task_name)
-        return (
-            np.asarray(size_defaults, dtype=np.float32),
-            np.asarray(relation_defaults, dtype=np.float32),
+def _demo_metadata_path(demo_path: str) -> Path:
+    path = Path(demo_path)
+    return path.with_suffix(".json")
+
+
+def _load_demo_metadata(demo_path: str) -> Dict[str, object]:
+    metadata_path = _demo_metadata_path(demo_path)
+    if not metadata_path.exists():
+        raise FileNotFoundError(
+            f"Missing ManiSkill trajectory metadata JSON: {metadata_path}. "
+            "size_parameters/relation_parameters are read from the ManiSkill environment "
+            "using this file's env_info and per-episode reset seeds."
         )
-    except KeyError:
-        pass
-    size_parameters = np.asarray(
-        TASK_SIZE_PARAMETER_DEFAULTS.get(task_name, tuple()),
+    with metadata_path.open("r", encoding="utf-8") as f:
+        metadata = json.load(f)
+    if "env_info" not in metadata:
+        raise KeyError(f"{metadata_path} missing env_info")
+    if "episodes" not in metadata:
+        raise KeyError(f"{metadata_path} missing episodes")
+    return metadata
+
+
+def _episode_for_traj(metadata: Dict[str, object], traj_name: str) -> Dict[str, object]:
+    episodes = metadata["episodes"]
+    if not isinstance(episodes, list):
+        raise TypeError("ManiSkill metadata episodes must be a list")
+    traj_index = _traj_sort_key(traj_name)
+    for episode in episodes:
+        if not isinstance(episode, dict):
+            raise TypeError("ManiSkill metadata episode records must be objects")
+        if int(episode["episode_id"]) == traj_index:
+            return episode
+    raise KeyError(f"ManiSkill metadata missing episode_id={traj_index} for {traj_name}")
+
+
+def _as_float_vector(value: object, *, name: str, length: Optional[int] = None) -> np.ndarray:
+    if hasattr(value, "detach"):
+        value = value.detach().cpu().numpy()
+    arr = np.asarray(value, dtype=np.float32).reshape(-1)
+    if length is not None and arr.shape[0] != length:
+        raise ValueError(f"{name}: expected length {length}, got {arr.shape[0]}")
+    return arr
+
+
+def _env_attr(env: object, name: str) -> object:
+    if not hasattr(env, name):
+        raise AttributeError(f"ManiSkill env {type(env).__name__} missing required attribute {name!r}")
+    return getattr(env, name)
+
+
+def _stackcube_structural_parameters(env: object) -> StructuralParameters:
+    cube_half_size = _as_float_vector(_env_attr(env, "cube_half_size"), name="cube_half_size", length=3)
+    cube_size = cube_half_size * 2.0
+    table_scene = _env_attr(env, "table_scene")
+    table_size = np.asarray(
+        [
+            float(_env_attr(table_scene, "table_length")),
+            float(_env_attr(table_scene, "table_width")),
+            float(_env_attr(table_scene, "table_height")),
+        ],
         dtype=np.float32,
     )
-    relation_parameters = np.asarray(
-        TASK_RELATION_PARAMETER_DEFAULTS.get(task_name, tuple()),
+    actor_sizes = np.stack([cube_size, cube_size, table_size], axis=0).astype(np.float32)
+    return StructuralParameters(
+        size_parameters=actor_sizes.reshape(-1).astype(np.float32),
+        relation_parameters=np.zeros((0,), dtype=np.float32),
+        actor_sizes=actor_sizes,
+    )
+
+
+def _plugcharger_structural_parameters(env: object) -> StructuralParameters:
+    base_half = _as_float_vector(_env_attr(env, "_base_size"), name="_base_size", length=3)
+    peg_half = _as_float_vector(_env_attr(env, "_peg_size"), name="_peg_size", length=3)
+    receptacle_half = _as_float_vector(_env_attr(env, "_receptacle_size"), name="_receptacle_size", length=3)
+    peg_gap_half = float(_env_attr(env, "_peg_gap"))
+    clearance = float(_env_attr(env, "_clearance"))
+
+    cleared_peg_half = peg_half.copy()
+    cleared_peg_half[1] += clearance
+    cleared_peg_half[2] += clearance
+    center_divider_half_y = peg_gap_half - cleared_peg_half[1]
+    if center_divider_half_y <= 0:
+        raise ValueError(
+            "PlugCharger center divider size is non-positive: "
+            f"_peg_gap={peg_gap_half}, cleared peg half-y={cleared_peg_half[1]}"
+        )
+
+    charger_body = base_half * 2.0
+    charger_prong = peg_half * 2.0
+    center_divider = np.asarray(
+        [
+            receptacle_half[0] * 2.0,
+            center_divider_half_y * 2.0,
+            cleared_peg_half[2] * 2.0,
+        ],
         dtype=np.float32,
     )
-    return size_parameters, relation_parameters
+    face_loop = np.asarray(
+        [
+            receptacle_half[0] * 2.0,
+            (peg_gap_half + cleared_peg_half[1]) * 2.0,
+            cleared_peg_half[2] * 2.0,
+            receptacle_half[1] * 2.0,
+            receptacle_half[2] * 2.0,
+        ],
+        dtype=np.float32,
+    )
+    size_parameters = np.concatenate(
+        [charger_body, charger_prong, center_divider, face_loop],
+        axis=0,
+    ).astype(np.float32)
+    relation_parameters = np.asarray([peg_gap_half], dtype=np.float32)
+    actor_sizes = np.stack([charger_body, receptacle_half * 2.0], axis=0).astype(np.float32)
+    return StructuralParameters(
+        size_parameters=size_parameters,
+        relation_parameters=relation_parameters,
+        actor_sizes=actor_sizes,
+    )
+
+
+class ManiSkillStructuralParameterReader:
+    def __init__(self, *, task_name: str, metadata: Dict[str, object]):
+        self.task_name = task_name
+        self.metadata = metadata
+        self._env = None
+        env_info = metadata["env_info"]
+        if not isinstance(env_info, dict):
+            raise TypeError("ManiSkill metadata env_info must be an object")
+        env_id = env_info["env_id"]
+        if env_id != task_name:
+            raise ValueError(f"Metadata env_id={env_id!r} does not match task_name={task_name!r}")
+        env_kwargs = env_info.get("env_kwargs")
+        if not isinstance(env_kwargs, dict):
+            raise TypeError("ManiSkill metadata env_info.env_kwargs must be an object")
+        self.env_kwargs = self._build_env_kwargs(env_kwargs)
+
+    @staticmethod
+    def _build_env_kwargs(env_kwargs: Dict[str, object]) -> Dict[str, object]:
+        kwargs = dict(env_kwargs)
+        kwargs["num_envs"] = 1
+        kwargs["obs_mode"] = "state"
+        kwargs["render_mode"] = None
+        kwargs.pop("sensor_configs", None)
+        kwargs.pop("human_render_camera_configs", None)
+        kwargs.pop("viewer_camera_configs", None)
+        return kwargs
+
+    def close(self) -> None:
+        if self._env is not None:
+            self._env.close()
+            self._env = None
+
+    def _make_env(self):
+        if self._env is None:
+            import gymnasium as gym
+            import mani_skill.envs  # noqa: F401
+
+            self._env = gym.make(self.task_name, **self.env_kwargs)
+        return self._env
+
+    def parameters_for_episode(self, episode: Dict[str, object]) -> StructuralParameters:
+        env = self._make_env()
+        reset_kwargs = episode.get("reset_kwargs")
+        if not isinstance(reset_kwargs, dict):
+            raise KeyError(f"Episode {episode.get('episode_id')} missing reset_kwargs")
+        if "seed" in reset_kwargs:
+            seed = reset_kwargs["seed"]
+        elif "episode_seed" in episode:
+            seed = episode["episode_seed"]
+        else:
+            raise KeyError(f"Episode {episode.get('episode_id')} missing reset seed")
+        options = reset_kwargs.get("options")
+        env.reset(seed=seed, options=options)
+        unwrapped = env.unwrapped
+        if self.task_name == "StackCube-v1":
+            return _stackcube_structural_parameters(unwrapped)
+        if self.task_name == "PlugCharger-v1":
+            return _plugcharger_structural_parameters(unwrapped)
+        raise ValueError(f"Unsupported task for ManiSkill structural parameters: {self.task_name}")
 
 
 def _write_dataset(group: h5py.Group, name: str, value: np.ndarray) -> None:
@@ -300,132 +406,167 @@ def build_keyframe_aux_dataset(
         stopping_delta=stopping_delta,
         min_separation=min_separation,
     )
-    sizes = TASK_GT_SIZES.get(task_name)
+    metadata = _load_demo_metadata(demo_path)
+    structural_reader = ManiSkillStructuralParameterReader(
+        task_name=task_name,
+        metadata=metadata,
+    )
     summary_rows = []
+    size_parameter_dim: Optional[int] = None
+    relation_parameter_dim: Optional[int] = None
 
-    with h5py.File(demo_path, "r") as f_in, h5py.File(output_path, "w") as f_out:
-        traj_names = sorted([k for k in f_in.keys() if k.startswith("traj_")], key=_traj_sort_key)
-        if num_traj is not None:
-            traj_names = traj_names[:num_traj]
+    try:
+        structural_reader._make_env()
+        with h5py.File(demo_path, "r") as f_in, h5py.File(output_path, "w") as f_out:
+            traj_names = sorted([k for k in f_in.keys() if k.startswith("traj_")], key=_traj_sort_key)
+            if num_traj is not None:
+                traj_names = traj_names[:num_traj]
 
-        f_out.attrs["source_demo_path"] = demo_path
-        f_out.attrs["task_name"] = task_name
-        f_out.attrs["actor_names"] = json.dumps(list(actor_names))
-        f_out.attrs["future_horizon"] = int(future_horizon)
-        if tcp_target not in {"pose", "pos", "pos_gripper"}:
-            raise ValueError(f"tcp_target must be 'pose', 'pos', or 'pos_gripper', got {tcp_target!r}")
-        if target_format is None:
-            if tcp_target == "pose":
-                target_format = "object_delta_pos_rot6d_plus_tcp_pose"
-            elif tcp_target == "pos":
-                target_format = "object_delta_pos_rot6d_plus_tcp_pos"
-            else:
-                target_format = "object_delta_pos_rot6d_plus_tcp_pos_gripper"
-        if target_format not in {
-            MAP4D_DIT_TARGET_FORMAT,
-            MAP4D_DIT_TCP_POS_GRIPPER_TARGET_FORMAT,
-            "object_delta_pos_rot6d_plus_tcp_pose",
-            "object_delta_pos_rot6d_plus_tcp_pos",
-            "object_delta_pos_rot6d_plus_tcp_pos_gripper",
-        }:
-            raise ValueError(f"Unsupported target_format={target_format!r}")
-        if target_format == MAP4D_DIT_TARGET_FORMAT and tcp_target != "pose":
-            raise ValueError(f"{MAP4D_DIT_TARGET_FORMAT} requires tcp_target='pose'")
-        if target_format == MAP4D_DIT_TCP_POS_GRIPPER_TARGET_FORMAT and tcp_target != "pos_gripper":
-            raise ValueError(
-                f"{MAP4D_DIT_TCP_POS_GRIPPER_TARGET_FORMAT} requires tcp_target='pos_gripper'"
-            )
-        f_out.attrs["tcp_target"] = tcp_target
-        f_out.attrs["tcp_dim"] = 7 if tcp_target == "pose" else 4 if tcp_target == "pos_gripper" else 3
-        f_out.attrs["target_format"] = target_format
-
-        for traj_name in traj_names:
-            traj = f_in[traj_name]
-            if target_format in {MAP4D_DIT_TARGET_FORMAT, MAP4D_DIT_TCP_POS_GRIPPER_TARGET_FORMAT}:
-                map4d = _load_pose_map4d_from_traj(traj, actor_names)
-                size_parameters, relation_parameters = _task_parameters(task_name)
-                group_map4d_dim = 9
-            else:
-                map4d = _load_map4d_from_traj(traj, actor_names, sizes)
-                size_parameters, relation_parameters = _task_parameters(task_name)
-                group_map4d_dim = 12
-            tcp_pose = traj["obs"]["extra"]["tcp_pose"][()].astype(np.float32)
-            if tcp_pose.shape[0] != map4d.shape[0]:
-                raise ValueError(
-                    f"{traj_name}: tcp_pose length {tcp_pose.shape[0]} != map4d length {map4d.shape[0]}"
-                )
-            gripper_target = _load_gripper_target(traj, map4d.shape[0])
-            if tcp_target == "pose":
-                tcp_target_seq = tcp_pose
-            elif tcp_target == "pos":
-                tcp_target_seq = tcp_pose[:, :3]
-            else:
-                tcp_target_seq = np.concatenate([tcp_pose[:, :3], gripper_target], axis=-1)
-
-            keyframe_data = extract_traj_keyframes(
-                traj,
-                gripper_source=gripper_source,
-                config=config,
-            )
-            keyframes = keyframe_data["keyframe_indices"].astype(np.int64)
-            future_table = build_future_keyframe_table(
-                keyframes,
-                num_frames=map4d.shape[0],
-                horizon=future_horizon,
-            )
-
-            group = f_out.create_group(traj_name)
-            group.attrs["num_frames"] = int(map4d.shape[0])
-            group.attrs["num_keyframes"] = int(len(keyframes))
-            group.attrs["tcp_target"] = tcp_target
-            group.attrs["map4d_dim"] = int(group_map4d_dim)
-            group.attrs["size_parameter_dim"] = int(size_parameters.shape[0])
-            group.attrs["relation_parameter_dim"] = int(relation_parameters.shape[0])
-            _write_dataset(group, "map4d", map4d)
-            _write_dataset(group, "size_parameters", size_parameters)
-            _write_dataset(group, "relation_parameters", relation_parameters)
-            _write_dataset(group, "tcp_pose", tcp_pose)
-            if tcp_target == "pos":
-                _write_dataset(group, "tcp_pos", tcp_target_seq)
-            elif tcp_target == "pos_gripper":
-                _write_dataset(group, "tcp_pos_gripper", tcp_target_seq)
-                _write_dataset(group, "gripper_target", gripper_target)
-            _write_dataset(group, "keyframe_indices", keyframes)
-            _write_dataset(group, "keyframe_tcp_pose", tcp_target_seq[keyframes])
-            _write_dataset(group, "future_keyframe_indices", future_table)
-
-            if materialize_targets:
-                if target_format == MAP4D_DIT_TARGET_FORMAT:
-                    object_targets, tcp_targets = gather_map4d_dit_keyframe_targets(
-                        map4d,
-                        tcp_pose,
-                        future_table,
-                    )
-                elif target_format == MAP4D_DIT_TCP_POS_GRIPPER_TARGET_FORMAT:
-                    object_targets, tcp_targets = gather_map4d_dit_pos_gripper_keyframe_targets(
-                        map4d,
-                        tcp_pose,
-                        gripper_target,
-                        future_table,
-                    )
+            f_out.attrs["source_demo_path"] = demo_path
+            f_out.attrs["source_metadata_path"] = str(_demo_metadata_path(demo_path))
+            f_out.attrs["task_name"] = task_name
+            f_out.attrs["actor_names"] = json.dumps(list(actor_names))
+            f_out.attrs["future_horizon"] = int(future_horizon)
+            f_out.attrs["structural_parameter_source"] = "maniskill_env"
+            if tcp_target not in {"pose", "pos", "pos_gripper"}:
+                raise ValueError(f"tcp_target must be 'pose', 'pos', or 'pos_gripper', got {tcp_target!r}")
+            if target_format is None:
+                if tcp_target == "pose":
+                    target_format = "object_delta_pos_rot6d_plus_tcp_pose"
+                elif tcp_target == "pos":
+                    target_format = "object_delta_pos_rot6d_plus_tcp_pos"
                 else:
-                    object_targets, tcp_targets = gather_keyframe_targets(
-                        map4d,
-                        tcp_target_seq,
-                        future_table,
-                    )
-                _write_dataset(group, "future_keyframe_object_targets", object_targets)
-                _write_dataset(group, "future_keyframe_tcp_pose", tcp_targets)
+                    target_format = "object_delta_pos_rot6d_plus_tcp_pos_gripper"
+            if target_format not in {
+                MAP4D_DIT_TARGET_FORMAT,
+                MAP4D_DIT_TCP_POS_GRIPPER_TARGET_FORMAT,
+                "object_delta_pos_rot6d_plus_tcp_pose",
+                "object_delta_pos_rot6d_plus_tcp_pos",
+                "object_delta_pos_rot6d_plus_tcp_pos_gripper",
+            }:
+                raise ValueError(f"Unsupported target_format={target_format!r}")
+            if target_format == MAP4D_DIT_TARGET_FORMAT and tcp_target != "pose":
+                raise ValueError(f"{MAP4D_DIT_TARGET_FORMAT} requires tcp_target='pose'")
+            if target_format == MAP4D_DIT_TCP_POS_GRIPPER_TARGET_FORMAT and tcp_target != "pos_gripper":
+                raise ValueError(
+                    f"{MAP4D_DIT_TCP_POS_GRIPPER_TARGET_FORMAT} requires tcp_target='pos_gripper'"
+                )
+            f_out.attrs["tcp_target"] = tcp_target
+            f_out.attrs["tcp_dim"] = 7 if tcp_target == "pose" else 4 if tcp_target == "pos_gripper" else 3
+            f_out.attrs["target_format"] = target_format
 
-            summary_rows.append(
-                {
-                    "traj": traj_name,
-                    "num_frames": int(map4d.shape[0]),
-                    "num_keyframes": int(len(keyframes)),
-                    "first_keyframes": keyframes[:10].tolist(),
-                    "last_keyframe": int(keyframes[-1]) if len(keyframes) else None,
-                }
-            )
+            for traj_name in traj_names:
+                traj = f_in[traj_name]
+                episode = _episode_for_traj(metadata, traj_name)
+                structural_parameters = structural_reader.parameters_for_episode(episode)
+                size_parameters = structural_parameters.size_parameters
+                relation_parameters = structural_parameters.relation_parameters
+                if size_parameter_dim is None:
+                    size_parameter_dim = int(size_parameters.shape[0])
+                    relation_parameter_dim = int(relation_parameters.shape[0])
+                elif (
+                    size_parameters.shape[0] != size_parameter_dim
+                    or relation_parameters.shape[0] != relation_parameter_dim
+                ):
+                    raise ValueError(
+                        f"{traj_name}: structural parameter dims changed from "
+                        f"({size_parameter_dim}, {relation_parameter_dim}) to "
+                        f"({size_parameters.shape[0]}, {relation_parameters.shape[0]})"
+                    )
+
+                if target_format in {MAP4D_DIT_TARGET_FORMAT, MAP4D_DIT_TCP_POS_GRIPPER_TARGET_FORMAT}:
+                    map4d = _load_pose_map4d_from_traj(traj, actor_names)
+                    group_map4d_dim = 9
+                else:
+                    map4d = _load_map4d_from_traj(
+                        traj,
+                        actor_names,
+                        structural_parameters.actor_sizes.reshape(-1),
+                    )
+                    group_map4d_dim = 12
+                tcp_pose = traj["obs"]["extra"]["tcp_pose"][()].astype(np.float32)
+                if tcp_pose.shape[0] != map4d.shape[0]:
+                    raise ValueError(
+                        f"{traj_name}: tcp_pose length {tcp_pose.shape[0]} != map4d length {map4d.shape[0]}"
+                    )
+                gripper_target = _load_gripper_target(traj, map4d.shape[0])
+                if tcp_target == "pose":
+                    tcp_target_seq = tcp_pose
+                elif tcp_target == "pos":
+                    tcp_target_seq = tcp_pose[:, :3]
+                else:
+                    tcp_target_seq = np.concatenate([tcp_pose[:, :3], gripper_target], axis=-1)
+
+                keyframe_data = extract_traj_keyframes(
+                    traj,
+                    gripper_source=gripper_source,
+                    config=config,
+                )
+                keyframes = keyframe_data["keyframe_indices"].astype(np.int64)
+                future_table = build_future_keyframe_table(
+                    keyframes,
+                    num_frames=map4d.shape[0],
+                    horizon=future_horizon,
+                )
+
+                group = f_out.create_group(traj_name)
+                group.attrs["num_frames"] = int(map4d.shape[0])
+                group.attrs["num_keyframes"] = int(len(keyframes))
+                group.attrs["tcp_target"] = tcp_target
+                group.attrs["map4d_dim"] = int(group_map4d_dim)
+                group.attrs["size_parameter_dim"] = int(size_parameters.shape[0])
+                group.attrs["relation_parameter_dim"] = int(relation_parameters.shape[0])
+                group.attrs["structural_parameter_source"] = "maniskill_env"
+                _write_dataset(group, "map4d", map4d)
+                _write_dataset(group, "size_parameters", size_parameters)
+                _write_dataset(group, "relation_parameters", relation_parameters)
+                _write_dataset(group, "tcp_pose", tcp_pose)
+                if tcp_target == "pos":
+                    _write_dataset(group, "tcp_pos", tcp_target_seq)
+                elif tcp_target == "pos_gripper":
+                    _write_dataset(group, "tcp_pos_gripper", tcp_target_seq)
+                    _write_dataset(group, "gripper_target", gripper_target)
+                _write_dataset(group, "keyframe_indices", keyframes)
+                _write_dataset(group, "keyframe_tcp_pose", tcp_target_seq[keyframes])
+                _write_dataset(group, "future_keyframe_indices", future_table)
+
+                if materialize_targets:
+                    if target_format == MAP4D_DIT_TARGET_FORMAT:
+                        object_targets, tcp_targets = gather_map4d_dit_keyframe_targets(
+                            map4d,
+                            tcp_pose,
+                            future_table,
+                        )
+                    elif target_format == MAP4D_DIT_TCP_POS_GRIPPER_TARGET_FORMAT:
+                        object_targets, tcp_targets = gather_map4d_dit_pos_gripper_keyframe_targets(
+                            map4d,
+                            tcp_pose,
+                            gripper_target,
+                            future_table,
+                        )
+                    else:
+                        object_targets, tcp_targets = gather_keyframe_targets(
+                            map4d,
+                            tcp_target_seq,
+                            future_table,
+                        )
+                    _write_dataset(group, "future_keyframe_object_targets", object_targets)
+                    _write_dataset(group, "future_keyframe_tcp_pose", tcp_targets)
+
+                summary_rows.append(
+                    {
+                        "traj": traj_name,
+                        "episode_id": int(episode["episode_id"]),
+                        "num_frames": int(map4d.shape[0]),
+                        "num_keyframes": int(len(keyframes)),
+                        "size_parameter_dim": int(size_parameters.shape[0]),
+                        "relation_parameter_dim": int(relation_parameters.shape[0]),
+                        "first_keyframes": keyframes[:10].tolist(),
+                        "last_keyframe": int(keyframes[-1]) if len(keyframes) else None,
+                    }
+                )
+    finally:
+        structural_reader.close()
 
     counts = [row["num_keyframes"] for row in summary_rows]
     return {
@@ -440,8 +581,9 @@ def build_keyframe_aux_dataset(
         "map4d_dim": 9
         if target_format in {MAP4D_DIT_TARGET_FORMAT, MAP4D_DIT_TCP_POS_GRIPPER_TARGET_FORMAT}
         else 12,
-        "size_parameter_dim": int(_task_parameters(task_name)[0].shape[0]),
-        "relation_parameter_dim": int(_task_parameters(task_name)[1].shape[0]),
+        "size_parameter_dim": int(size_parameter_dim or 0),
+        "relation_parameter_dim": int(relation_parameter_dim or 0),
+        "structural_parameter_source": "maniskill_env",
         "materialize_targets": materialize_targets,
         "num_trajectories": len(summary_rows),
         "min_keyframes": int(np.min(counts)) if counts else 0,

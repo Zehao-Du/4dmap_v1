@@ -35,8 +35,10 @@ from map4d.backbone.eval_maniskill import build_rollout_evaluator
 from map4d.backbone.model.common.lr_scheduler import get_scheduler
 from map4d.backbone.model.diffusion.ema_model import EMAModel
 from map4d.backbone.policy.map4d_dit_policy import Map4DDiTPolicy
+from map4d.representation.maps4d.metadata import get_task_metadata_value
 
 OmegaConf.register_new_resolver("eval", eval, replace=True)
+OmegaConf.register_new_resolver("map4d_meta", get_task_metadata_value, replace=True)
 
 
 def _world_info():
@@ -361,8 +363,8 @@ class TrainMap4DDiTWorkspace:
                         num_eval_envs=int(cfg.training.get("num_eval_envs", 10)),
                         n_obs_steps=int(cfg.n_obs_steps),
                         robot_state_dim=int(cfg.robot_state_dim),
-                        size_parameter_dim=int(cfg.task.get("size_parameter_dim", 0)),
-                        relation_parameter_dim=int(cfg.task.get("relation_parameter_dim", 0)),
+                        size_parameter_dim=int(cfg.size_parameter_dim),
+                        relation_parameter_dim=int(cfg.relation_parameter_dim),
                         device=device,
                         use_rgb=False,
                         rgb_feature_dim=int(cfg.policy.model_cfg.get("rgb_feature_dim", 384)),
