@@ -49,6 +49,13 @@ policy:
     tcp_dim: ${task.keyframe_tcp_dim}
     rgb_feature_dim: 288
     semantic_feature_dim: 288
+    semantic_feature_mode: precomputed
+    dinov3_model: dinov3_vits16
+    dinov3_weights_path: /data2/zehao/models/DINOv3/DINOv3_ViT_LVD_1689M/dinov3_vits16_pretrain_lvd1689m-08c60483.pth
+    dinov3_third_party_dir: /data2/zehao/MAP4D/4dmap_v1/map4d/backbone/model/vision/dinov3
+    dinov3_image_size: 224
+    dinov3_input_multiple: 16
+    dinov3_amp: true
     map_feature_dim: 240
     n_map_step: ${n_obs_steps}
     num_map_nodes: ${num_map_nodes}

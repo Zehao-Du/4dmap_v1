@@ -24,6 +24,7 @@ dataset:
   use_depth: false
   rgb_feature_dim: ${policy.model_cfg.rgb_feature_dim}
   semantic_feature_dim: ${policy.model_cfg.semantic_feature_dim}
+  semantic_feature_mode: ${policy.model_cfg.semantic_feature_mode}
   map_feature_dim: ${policy.model_cfg.map_feature_dim}
   keyframe_tcp_dim: ${task.keyframe_tcp_dim}
   allow_missing_rgb_feature: false

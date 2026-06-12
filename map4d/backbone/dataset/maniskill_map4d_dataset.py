@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import os
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
@@ -283,8 +284,10 @@ class ManiSkillMap4DDataset(BaseDataset):
         rgb_feature_dim: int = 288,
         semantic_feature_dim: Optional[int] = None,
         map_feature_dim: int = 240,
+        semantic_feature_mode: str = "precomputed",
         pointcloud_path: str = "obs/point_cloud/fused",
         dino_feature_path: str = "obs/dino_feature",
+        pointcloud_source_path: str = "obs/point_cloud_source/fused",
         keyframe_tcp_dim: Optional[int] = None,
         allow_missing_rgb_feature: bool = False,
         allow_raw_rgb_stats_feature: bool = False,
@@ -316,8 +319,15 @@ class ManiSkillMap4DDataset(BaseDataset):
             None if semantic_feature_dim is None else int(semantic_feature_dim)
         )
         self.map_feature_dim = int(map_feature_dim)
+        self.semantic_feature_mode = str(semantic_feature_mode)
+        if self.semantic_feature_mode not in {"precomputed", "online_dinov3"}:
+            raise ValueError(
+                "semantic_feature_mode must be 'precomputed' or 'online_dinov3', "
+                f"got {self.semantic_feature_mode!r}"
+            )
         self.pointcloud_path = str(pointcloud_path)
         self.dino_feature_path = str(dino_feature_path)
+        self.pointcloud_source_path = str(pointcloud_source_path)
         self.keyframe_tcp_dim = None if keyframe_tcp_dim is None else int(keyframe_tcp_dim)
         self.allow_missing_rgb_feature = bool(allow_missing_rgb_feature)
         self.allow_raw_rgb_stats_feature = bool(allow_raw_rgb_stats_feature)
@@ -459,7 +469,15 @@ class ManiSkillMap4DDataset(BaseDataset):
             )
         return shape
 
-    def _load_h5_window(self, traj_name: str, path: str, start: int, horizon: int) -> np.ndarray:
+    def _load_h5_window(
+        self,
+        traj_name: str,
+        path: str,
+        start: int,
+        horizon: int,
+        *,
+        dtype=np.float32,
+    ) -> np.ndarray:
         f = self._get_demo_file()
         dataset = _get_dataset_node(f[traj_name], path)
         if dataset is None:
@@ -473,7 +491,98 @@ class ManiSkillMap4DDataset(BaseDataset):
         read_start = int(clipped.min())
         read_end = int(clipped.max()) + 1
         window = dataset[read_start:read_end]
-        return np.asarray(window[clipped - read_start], dtype=np.float32)
+        value = window[clipped - read_start]
+        if dtype is None:
+            return np.asarray(value)
+        return np.asarray(value, dtype=dtype)
+
+    def _pointcloud_cameras(self, traj: h5py.Group) -> Tuple[str, ...]:
+        raw = traj.attrs.get("pointcloud_cameras")
+        if raw is None:
+            raise KeyError(f"{traj.name} missing pointcloud_cameras attr")
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8")
+        cameras = json.loads(str(raw))
+        if not isinstance(cameras, list) or not all(isinstance(item, str) for item in cameras):
+            raise ValueError(f"{traj.name} pointcloud_cameras attr must be a JSON list string, got {raw!r}")
+        if not cameras:
+            raise ValueError(f"{traj.name} pointcloud_cameras must not be empty")
+        return tuple(cameras)
+
+    def _validate_online_dinov3_inputs(
+        self,
+        traj: h5py.Group,
+        length: int,
+        point_count: int,
+    ) -> Tuple[str, ...]:
+        camera_names = self._pointcloud_cameras(traj)
+        camera_index = _get_dataset_node(traj, f"{self.pointcloud_source_path}/camera_index")
+        pixel_uv = _get_dataset_node(traj, f"{self.pointcloud_source_path}/pixel_uv")
+        if camera_index is None:
+            raise KeyError(f"{traj.name} missing {self.pointcloud_source_path}/camera_index")
+        if pixel_uv is None:
+            raise KeyError(f"{traj.name} missing {self.pointcloud_source_path}/pixel_uv")
+        if not isinstance(camera_index, h5py.Dataset):
+            raise TypeError(f"{traj.name}/{self.pointcloud_source_path}/camera_index must be an HDF5 dataset")
+        if not isinstance(pixel_uv, h5py.Dataset):
+            raise TypeError(f"{traj.name}/{self.pointcloud_source_path}/pixel_uv must be an HDF5 dataset")
+        if tuple(camera_index.shape) != (length, point_count):
+            raise ValueError(
+                f"{traj.name}: camera_index shape {tuple(camera_index.shape)} must match "
+                f"point cloud [T,P] {(length, point_count)}"
+            )
+        if tuple(pixel_uv.shape) != (length, point_count, 2):
+            raise ValueError(
+                f"{traj.name}: pixel_uv shape {tuple(pixel_uv.shape)} must match "
+                f"point cloud [T,P,2] {(length, point_count, 2)}"
+            )
+        for camera_name in camera_names:
+            rgb = _get_dataset_node(traj, f"obs/sensor_data/{camera_name}/rgb")
+            if rgb is None:
+                raise KeyError(f"{traj.name} missing obs/sensor_data/{camera_name}/rgb")
+            if not isinstance(rgb, h5py.Dataset):
+                raise TypeError(f"{traj.name}/obs/sensor_data/{camera_name}/rgb must be an HDF5 dataset")
+            if len(rgb.shape) != 4 or rgb.shape[0] != length or rgb.shape[-1] != 3:
+                raise ValueError(
+                    f"{traj.name}/obs/sensor_data/{camera_name}/rgb must be [T,H,W,3] "
+                    f"with T={length}, got {tuple(rgb.shape)}"
+                )
+        return camera_names
+
+    def _load_online_dinov3_window(
+        self,
+        traj_name: str,
+        camera_names: Sequence[str],
+        start: int,
+        horizon: int,
+    ) -> Dict[str, np.ndarray]:
+        rgb = [
+            self._load_h5_window(
+                traj_name,
+                f"obs/sensor_data/{camera_name}/rgb",
+                start,
+                horizon,
+                dtype=None,
+            )
+            for camera_name in camera_names
+        ]
+        return {
+            "rgb": np.stack(rgb, axis=1),
+            "point_camera_index": self._load_h5_window(
+                traj_name,
+                f"{self.pointcloud_source_path}/camera_index",
+                start,
+                horizon,
+                dtype=np.int64,
+            ),
+            "point_pixel_uv": self._load_h5_window(
+                traj_name,
+                f"{self.pointcloud_source_path}/pixel_uv",
+                start,
+                horizon,
+                dtype=np.int64,
+            ),
+        }
 
     def _format_rgb_feature(self, feature: np.ndarray, length: int) -> np.ndarray:
         feature = np.asarray(feature, dtype=np.float32)
@@ -694,7 +803,16 @@ class ManiSkillMap4DDataset(BaseDataset):
                 dino_feature = None
                 if self.use_rgb:
                     point_cloud_shape = self._validate_point_cloud(traj, seq_len)
-                    dino_feature_shape = self._validate_dino_feature(traj, seq_len, point_cloud_shape[1])
+                    dino_feature_shape = None
+                    camera_names = None
+                    if self.semantic_feature_mode == "precomputed":
+                        dino_feature_shape = self._validate_dino_feature(traj, seq_len, point_cloud_shape[1])
+                    elif self.semantic_feature_mode == "online_dinov3":
+                        camera_names = self._validate_online_dinov3_inputs(
+                            traj, seq_len, point_cloud_shape[1]
+                        )
+                    else:
+                        raise ValueError(f"Unsupported semantic_feature_mode={self.semantic_feature_mode!r}")
 
                 if sidecar is None:
                     keyframes = np.arange(seq_len, dtype=np.int64)
@@ -744,7 +862,10 @@ class ManiSkillMap4DDataset(BaseDataset):
                 if self.use_rgb:
                     record["traj_name"] = traj_name
                     record["point_cloud_shape"] = point_cloud_shape
-                    record["dino_feature_shape"] = dino_feature_shape
+                    if dino_feature_shape is not None:
+                        record["dino_feature_shape"] = dino_feature_shape
+                    if camera_names is not None:
+                        record["camera_names"] = camera_names
                 trajectories.append(record)
         if not trajectories:
             raise ValueError(f"No traj_* groups found in {demo_path}")
@@ -861,13 +982,28 @@ class ManiSkillMap4DDataset(BaseDataset):
             sample["obs"]["point_cloud"] = self._load_h5_window(
                 traj["traj_name"], self.pointcloud_path, obs_start, self.n_obs_steps
             )
-            sample["obs"]["dino_feature"] = self._load_h5_window(
-                traj["traj_name"], self.dino_feature_path, obs_start, self.n_obs_steps
-            )
+            if self.semantic_feature_mode == "precomputed":
+                sample["obs"]["dino_feature"] = self._load_h5_window(
+                    traj["traj_name"], self.dino_feature_path, obs_start, self.n_obs_steps
+                )
+            elif self.semantic_feature_mode == "online_dinov3":
+                sample["obs"].update(
+                    self._load_online_dinov3_window(
+                        traj["traj_name"],
+                        traj["camera_names"],
+                        obs_start,
+                        self.n_obs_steps,
+                    )
+                )
+            else:
+                raise ValueError(f"Unsupported semantic_feature_mode={self.semantic_feature_mode!r}")
         return _to_tensor_tree(sample)
 
 
 def _to_tensor_tree(value):
     if isinstance(value, dict):
         return {key: _to_tensor_tree(item) for key, item in value.items()}
-    return torch.from_numpy(np.asarray(value, dtype=np.float32))
+    array = np.asarray(value)
+    if array.dtype.kind in {"b", "i", "u"}:
+        return torch.from_numpy(array)
+    return torch.from_numpy(array.astype(np.float32, copy=False))
