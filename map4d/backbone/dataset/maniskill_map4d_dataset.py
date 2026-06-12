@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import os
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -321,6 +322,8 @@ class ManiSkillMap4DDataset(BaseDataset):
         self.allow_missing_rgb_feature = bool(allow_missing_rgb_feature)
         self.allow_raw_rgb_stats_feature = bool(allow_raw_rgb_stats_feature)
         self.strict_target_format = bool(strict_target_format)
+        self._demo_file = None
+        self._demo_file_pid = None
         if isinstance(num_traj, str):
             num_traj = None if num_traj.lower() in {"", "none", "null"} else int(num_traj)
 
@@ -400,38 +403,77 @@ class ManiSkillMap4DDataset(BaseDataset):
             trajectories.append(record)
         return trajectories
 
-    def _load_point_cloud(self, traj: h5py.Group, length: int) -> np.ndarray:
-        point_cloud = _read_dataset(traj, self.pointcloud_path)
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["_demo_file"] = None
+        state["_demo_file_pid"] = None
+        return state
+
+    def _get_demo_file(self):
+        if h5py is None:
+            raise ModuleNotFoundError("h5py is required to load ManiSkill HDF5 demos")
+        pid = os.getpid()
+        if self._demo_file is None or self._demo_file_pid != pid:
+            if self._demo_file is not None:
+                try:
+                    self._demo_file.close()
+                except Exception:
+                    pass
+            self._demo_file = h5py.File(self.demo_path, "r")
+            self._demo_file_pid = pid
+        return self._demo_file
+
+    def _validate_point_cloud(self, traj: h5py.Group, length: int) -> Tuple[int, ...]:
+        point_cloud = _get_dataset_node(traj, self.pointcloud_path)
         if point_cloud is None:
             raise KeyError(f"{traj.name} missing {self.pointcloud_path}")
-        point_cloud = np.asarray(point_cloud, dtype=np.float32)
-        if point_cloud.ndim != 3 or point_cloud.shape[0] != length or point_cloud.shape[-1] < 3:
+        if not isinstance(point_cloud, h5py.Dataset):
+            raise TypeError(f"{traj.name}/{self.pointcloud_path} must be an HDF5 dataset")
+        shape = tuple(point_cloud.shape)
+        if len(shape) != 3 or shape[0] != length or shape[-1] < 3:
             raise ValueError(
                 f"{traj.name}/{self.pointcloud_path} must be [T,P,>=3] with T={length}, "
-                f"got {point_cloud.shape}"
+                f"got {shape}"
             )
-        return point_cloud
+        return shape
 
-    def _load_dino_feature(self, traj: h5py.Group, length: int, point_count: int) -> np.ndarray:
+    def _validate_dino_feature(self, traj: h5py.Group, length: int, point_count: int) -> Tuple[int, ...]:
         dino_node = _get_dataset_node(traj, self.dino_feature_path)
         if dino_node is None:
             raise KeyError(f"{traj.name} missing {self.dino_feature_path}")
+        if not isinstance(dino_node, h5py.Dataset):
+            raise TypeError(f"{traj.name}/{self.dino_feature_path} must be an HDF5 dataset")
         _require_dino_provenance(traj.name, dino_node)
-        dino_feature = dino_node[()]
-        dino_feature = np.asarray(dino_feature, dtype=np.float32)
-        if dino_feature.ndim != 3:
-            raise ValueError(f"{traj.name}/{self.dino_feature_path} must be [T,P,D], got {dino_feature.shape}")
-        if dino_feature.shape[:2] != (length, point_count):
+        shape = tuple(dino_node.shape)
+        if len(shape) != 3:
+            raise ValueError(f"{traj.name}/{self.dino_feature_path} must be [T,P,D], got {shape}")
+        if shape[:2] != (length, point_count):
             raise ValueError(
                 f"{traj.name}: point_cloud and dino_feature must share [T,P], "
-                f"got {(length, point_count)} and {dino_feature.shape[:2]}"
+                f"got {(length, point_count)} and {shape[:2]}"
             )
-        if self.semantic_feature_dim is not None and dino_feature.shape[-1] != self.semantic_feature_dim:
+        if self.semantic_feature_dim is not None and shape[-1] != self.semantic_feature_dim:
             raise ValueError(
                 f"{traj.name}: expected semantic_feature_dim={self.semantic_feature_dim}, "
-                f"got {dino_feature.shape[-1]}"
+                f"got {shape[-1]}"
             )
-        return dino_feature
+        return shape
+
+    def _load_h5_window(self, traj_name: str, path: str, start: int, horizon: int) -> np.ndarray:
+        f = self._get_demo_file()
+        dataset = _get_dataset_node(f[traj_name], path)
+        if dataset is None:
+            raise KeyError(f"/{traj_name} missing {path}")
+        if not isinstance(dataset, h5py.Dataset):
+            raise TypeError(f"/{traj_name}/{path} must be an HDF5 dataset")
+        if dataset.shape[0] <= 0:
+            raise ValueError(f"/{traj_name}/{path} has empty time dimension")
+        indices = np.arange(start, start + horizon)
+        clipped = np.clip(indices, 0, dataset.shape[0] - 1)
+        read_start = int(clipped.min())
+        read_end = int(clipped.max()) + 1
+        window = dataset[read_start:read_end]
+        return np.asarray(window[clipped - read_start], dtype=np.float32)
 
     def _format_rgb_feature(self, feature: np.ndarray, length: int) -> np.ndarray:
         feature = np.asarray(feature, dtype=np.float32)
@@ -651,8 +693,8 @@ class ManiSkillMap4DDataset(BaseDataset):
                 point_cloud = None
                 dino_feature = None
                 if self.use_rgb:
-                    point_cloud = self._load_point_cloud(traj, seq_len)
-                    dino_feature = self._load_dino_feature(traj, seq_len, point_cloud.shape[1])
+                    point_cloud_shape = self._validate_point_cloud(traj, seq_len)
+                    dino_feature_shape = self._validate_dino_feature(traj, seq_len, point_cloud_shape[1])
 
                 if sidecar is None:
                     keyframes = np.arange(seq_len, dtype=np.int64)
@@ -699,6 +741,10 @@ class ManiSkillMap4DDataset(BaseDataset):
                     record["point_cloud"] = point_cloud.astype(np.float32)
                 if dino_feature is not None:
                     record["dino_feature"] = dino_feature.astype(np.float32)
+                if self.use_rgb:
+                    record["traj_name"] = traj_name
+                    record["point_cloud_shape"] = point_cloud_shape
+                    record["dino_feature_shape"] = dino_feature_shape
                 trajectories.append(record)
         if not trajectories:
             raise ValueError(f"No traj_* groups found in {demo_path}")
@@ -726,6 +772,8 @@ class ManiSkillMap4DDataset(BaseDataset):
 
     def get_validation_dataset(self):
         val_set = copy.copy(self)
+        val_set._demo_file = None
+        val_set._demo_file_pid = None
         val_set.indices = list(self.val_indices)
         val_set.val_indices = []
         return val_set
@@ -810,11 +858,11 @@ class ManiSkillMap4DDataset(BaseDataset):
                 traj["rgb_feature"], obs_start, self.n_obs_steps
             )
         if self.use_rgb:
-            sample["obs"]["point_cloud"] = self._slice_with_pad(
-                traj["point_cloud"], obs_start, self.n_obs_steps
+            sample["obs"]["point_cloud"] = self._load_h5_window(
+                traj["traj_name"], self.pointcloud_path, obs_start, self.n_obs_steps
             )
-            sample["obs"]["dino_feature"] = self._slice_with_pad(
-                traj["dino_feature"], obs_start, self.n_obs_steps
+            sample["obs"]["dino_feature"] = self._load_h5_window(
+                traj["traj_name"], self.dino_feature_path, obs_start, self.n_obs_steps
             )
         return _to_tensor_tree(sample)
 
