@@ -58,78 +58,57 @@ _REPO_ROOT = os.path.abspath(os.path.join(_BASELINE_DIR, "..", ".."))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
+from map4d.construction import ManiSkillGTMap4dConstructor
+from map4d.construction.utils import load_map_metadata_for_task, map_dims_from_metadata
+
 # --------------------------------------------------------------------------- #
-# Map4D GT helpers (from DP train_rgbd.py)
+# Map4D GT helpers
 # --------------------------------------------------------------------------- #
-STACKCUBE_GT_SIZES_MANISKILL_XYZ = (
-    0.04, 0.04, 0.04,
-    0.04, 0.04, 0.04,
-    1.2090764, 2.4178784, 0.91964292762787,
-)
-
-PLUGCHARGER_GT_SIZES_MANISKILL_XYZ = (
-    0.04, 0.03, 0.024,       # charger body (2 * _base_size)
-    0.02, 0.1, 0.1,          # receptacle (2 * _receptacle_size)
-)
-
-TASK_GT_SIZES = {
-    "StackCube-v1": STACKCUBE_GT_SIZES_MANISKILL_XYZ,
-    "PlugCharger-v1": PLUGCHARGER_GT_SIZES_MANISKILL_XYZ,
-}
+def _metadata_num_objects(task_metadata):
+    objects = task_metadata.get("objects", {})
+    if objects:
+        return len(objects)
+    return len(task_metadata.get("actor_names", ()))
 
 
-def _quat_wxyz_to_rotation_6d_np(quat_wxyz):
-    quat = np.asarray(quat_wxyz, dtype=np.float32)
-    if quat.ndim != 2 or quat.shape[1] != 4:
-        raise ValueError(f"Expected quaternion shape [T, 4], got {quat.shape}")
-    quat = quat / np.linalg.norm(quat, axis=1, keepdims=True).clip(min=1e-8)
-    w, x, y, z = quat[:, 0], quat[:, 1], quat[:, 2], quat[:, 3]
-    matrix = np.empty((quat.shape[0], 3, 3), dtype=np.float32)
-    matrix[:, 0, 0] = 1.0 - 2.0 * (y * y + z * z)
-    matrix[:, 0, 1] = 2.0 * (x * y - z * w)
-    matrix[:, 0, 2] = 2.0 * (x * z + y * w)
-    matrix[:, 1, 0] = 2.0 * (x * y + z * w)
-    matrix[:, 1, 1] = 1.0 - 2.0 * (x * x + z * z)
-    matrix[:, 1, 2] = 2.0 * (y * z - x * w)
-    matrix[:, 2, 0] = 2.0 * (x * z - y * w)
-    matrix[:, 2, 1] = 2.0 * (y * z + x * w)
-    matrix[:, 2, 2] = 1.0 - 2.0 * (x * x + y * y)
-    return np.concatenate([matrix[:, :, 0], matrix[:, :, 1]], axis=1).astype(np.float32)
+def _parameters_to_raw_tensor(parameters):
+    return torch.cat(
+        [
+            parameters["size_parameters"],
+            parameters["positions"],
+            parameters["rotations"],
+        ],
+        dim=-1,
+    ).float()
 
 
-def _actor_states_to_map4d_tensor(actor_states, *, sizes=None):
-    states = [np.asarray(state, dtype=np.float32) for state in actor_states]
-    num_objects = len(states)
-    frame_count = states[0].shape[0]
-    if any(state.shape[0] != frame_count for state in states):
-        raise ValueError("All actor state arrays must have the same frame count.")
-    if sizes is not None:
-        sizes_np = np.asarray(sizes, dtype=np.float32).reshape(num_objects, 3)
-    else:
-        sizes_np = np.zeros((num_objects, 3), dtype=np.float32)
-    sizes_seq = np.broadcast_to(sizes_np, (frame_count, num_objects, 3))
-    positions = np.stack([state[:, 0:3] for state in states], axis=1)
-    rotations = np.stack(
-        [_quat_wxyz_to_rotation_6d_np(state[:, 3:7]) for state in states], axis=1,
-    )
-    return np.concatenate([sizes_seq, positions, rotations], axis=-1).astype(np.float32)
-
-
-TASK_ACTOR_NAMES = {
-    "StackCube-v1": ("cubeA", "cubeB", "table-workspace"),
-    "PlugCharger-v1": ("charger", "receptacle"),
-}
+def _configure_map4d_args_from_metadata(args):
+    if not args.use_map4d:
+        return None
+    task_metadata = load_map_metadata_for_task(args.map4d_task_name)
+    dims = map_dims_from_metadata(task_metadata)
+    args.map4d_num_objects = _metadata_num_objects(task_metadata)
+    args.map4d_raw_dim = dims["total"]
+    args.map4d_size_end = dims["size_end"]
+    args.map4d_position_end = dims["position_end"]
+    args.map4d_rotation_end = dims["rotation_end"]
+    args.map4d_pose_dim = dims["position"] + dims["rotation"]
+    return task_metadata
 
 
 def _load_maniskill_gt_map4d_tensors(
     data_path, *, num_traj=None, task_name="StackCube-v1",
     actor_names=None, device=None,
 ):
+    constructor = ManiSkillGTMap4dConstructor(
+        task_name=task_name,
+        device="cpu" if device is None else str(device),
+    )
     if actor_names is None:
-        actor_names = TASK_ACTOR_NAMES.get(task_name)
-        if actor_names is None:
-            raise ValueError(f"No default actor_names for task {task_name}. Provide actor_names explicitly.")
-    sizes = TASK_GT_SIZES.get(task_name)
+        actor_names = constructor.actor_names
+    else:
+        actor_names = tuple(actor_names)
+        constructor.actor_names = actor_names
     import h5py
     with h5py.File(data_path, "r") as f:
         traj_keys = [key for key in f.keys() if key.startswith("traj_")]
@@ -143,8 +122,11 @@ def _load_maniskill_gt_map4d_tensors(
             if missing:
                 raise KeyError(f"{traj_key} missing ManiSkill GT actors: {missing}")
             actor_states = [actors[name][()] for name in actor_names]
-            map4d_np = _actor_states_to_map4d_tensor(actor_states, sizes=sizes)
-            map4d_tensors.append(torch.as_tensor(map4d_np, device=device))
+            constructor.actor_states = actor_states
+            map4d_tensor = _parameters_to_raw_tensor(constructor.parameters_train())
+            if device is not None:
+                map4d_tensor = map4d_tensor.to(device=device)
+            map4d_tensors.append(map4d_tensor)
     return map4d_tensors
 
 
@@ -255,6 +237,9 @@ class Args:
     map4d_pre_horizon: int = 6
     map4d_future_horizon: int = 3
     map4d_num_objects: int = 3
+    """derived from map4d_task_name metadata when use_map4d=True"""
+    map4d_raw_dim: Optional[int] = None
+    """derived flat dim: size_parameters + positions + rotations"""
     map4d_tcp_dim: int = 7
     map4d_feature_dim: int = 128
     map4d_node_dim: int = 128
@@ -425,7 +410,7 @@ class SmallDemoDataset_ACTPolicy(Dataset):
 
         # Map4d slicing
         if self.use_map4d:
-            map4d_traj = self.map4d_tensors[traj_idx]  # (T, N, feat)
+            map4d_traj = self.map4d_tensors[traj_idx]
             T_len = map4d_traj.shape[0]
             # Slice pre_horizon frames ending at ts (inclusive)
             start = max(0, ts + 1 - self.map4d_pre_horizon)
@@ -434,8 +419,8 @@ class SmallDemoDataset_ACTPolicy(Dataset):
             # Pad if not enough frames at the beginning
             if map4d_seq.shape[0] < self.map4d_pre_horizon:
                 pad_len = self.map4d_pre_horizon - map4d_seq.shape[0]
-                map4d_seq = torch.cat([map4d_seq[:1].expand(pad_len, -1, -1), map4d_seq], dim=0)
-            obs['map4d'] = map4d_seq  # (pre_horizon, N, feat)
+                map4d_seq = torch.cat([map4d_seq[:1].expand(pad_len, *map4d_seq.shape[1:]), map4d_seq], dim=0)
+            obs['map4d'] = map4d_seq
 
             # Future map4d for auxiliary loss
             fut_start = ts + 1
@@ -444,10 +429,10 @@ class SmallDemoDataset_ACTPolicy(Dataset):
             if future_map4d.shape[0] < self.map4d_future_horizon:
                 pad_len = self.map4d_future_horizon - future_map4d.shape[0]
                 if future_map4d.shape[0] > 0:
-                    future_map4d = torch.cat([future_map4d, future_map4d[-1:].expand(pad_len, -1, -1)], dim=0)
+                    future_map4d = torch.cat([future_map4d, future_map4d[-1:].expand(pad_len, *future_map4d.shape[1:])], dim=0)
                 else:
-                    future_map4d = map4d_traj[ts:ts+1].expand(self.map4d_future_horizon, -1, -1)
-            obs['future_map4d'] = future_map4d  # (future_horizon, N, feat)
+                    future_map4d = map4d_traj[ts:ts+1].expand(self.map4d_future_horizon, *map4d_traj.shape[1:])
+            obs['future_map4d'] = future_map4d
             if self.keyframe_aux_trajs is not None:
                 aux_traj = self.keyframe_aux_trajs[traj_idx]
                 obs['future_keyframe_indices'] = aux_traj['future_keyframe_indices'][ts]
@@ -569,6 +554,10 @@ class Agent(nn.Module):
         if args.map4d_aux_loss and self.map4d_keyframe_aux_loss:
             raise ValueError("Use either --map4d-aux-loss or --map4d-keyframe-aux-loss, not both.")
         self.map4d_feature_dim = args.map4d_feature_dim if args.use_map4d else 0
+        self.map4d_raw_dim = args.map4d_raw_dim if args.use_map4d else 0
+        self.map4d_size_end = getattr(args, "map4d_size_end", 0)
+        self.map4d_position_end = getattr(args, "map4d_position_end", 0)
+        self.map4d_rotation_end = getattr(args, "map4d_rotation_end", 0)
         self.include_depth = args.include_depth
         self.normalize = T.Normalize(mean=[0.485, 0.456, 0.406],
                                      std=[0.229, 0.224, 0.225])
@@ -626,7 +615,7 @@ class Agent(nn.Module):
 
         # raw_concat: expand state_dim; encoder mode: use map4d_dim as context token
         if self.map4d_raw_concat:
-            raw_map4d_dim = args.map4d_num_objects * 12
+            raw_map4d_dim = args.map4d_raw_dim
             model_state_dim = self.state_dim + raw_map4d_dim
             model_map4d_dim = 0
         elif self.map4d_as_tokens:
@@ -641,7 +630,7 @@ class Agent(nn.Module):
 
         # mlp_token: flatten all frames → MLP → map4d_feature_dim
         if self.map4d_mlp_token:
-            mlp_input_dim = args.map4d_pre_horizon * args.map4d_num_objects * 12
+            mlp_input_dim = args.map4d_pre_horizon * args.map4d_raw_dim
             self.map4d_mlp = nn.Sequential(
                 nn.Linear(mlp_input_dim, args.hidden_dim),
                 nn.ReLU(),
@@ -650,8 +639,8 @@ class Agent(nn.Module):
 
         # map4d as tokens params
         if self.map4d_as_tokens:
-            map4d_token_dim = 12  # per-object per-frame: size(3)+pos(3)+rot(6)
-            map4d_max_tokens = args.map4d_pre_horizon * args.map4d_num_objects
+            map4d_token_dim = args.map4d_raw_dim
+            map4d_max_tokens = args.map4d_pre_horizon
         else:
             map4d_token_dim = 0
             map4d_max_tokens = 0
@@ -680,7 +669,7 @@ class Agent(nn.Module):
                     self.map4d_num_objects * 9 + self.map4d_tcp_dim
                 )
             else:
-                future_target_dim = self.future_horizon * self.map4d_num_objects * 9
+                future_target_dim = self.future_horizon * args.map4d_pose_dim
             # Learned query + cross-attention readout from full encoder memory
             self.aux_query = nn.Parameter(torch.randn(1, 1, args.hidden_dim))
             self.aux_cross_attn = nn.MultiheadAttention(
@@ -734,9 +723,9 @@ class Agent(nn.Module):
 
     def _get_raw_map4d_state(self, obs):
         """Flatten last frame of map4d and return for state concat."""
-        map4d_seq = obs['map4d']  # (B, pre_horizon, N, 12)
-        last_frame = map4d_seq[:, -1]  # (B, N, 12)
-        return last_frame.reshape(last_frame.shape[0], -1)  # (B, N*12)
+        map4d_seq = obs['map4d']
+        last_frame = map4d_seq[:, -1]
+        return last_frame.reshape(last_frame.shape[0], -1)
 
     def compute_loss(self, obs, action_seq):
         # normalize rgb data
@@ -747,16 +736,18 @@ class Agent(nn.Module):
 
         if self.map4d_as_tokens:
             obs_for_model = self._policy_obs(obs)
-            # Flatten map4d (B, T, N, 12) → (B, T*N, 12) as tokens
             map4d_seq = obs['map4d']
-            B, T, N, D = map4d_seq.shape
-            obs_for_model['map4d_tokens'] = map4d_seq.reshape(B, T * N, D)
+            if map4d_seq.dim() == 3:
+                obs_for_model['map4d_tokens'] = map4d_seq
+            else:
+                B, T, N, D = map4d_seq.shape
+                obs_for_model['map4d_tokens'] = map4d_seq.reshape(B, T * N, D)
             a_hat, (mu, logvar), encoder_memory = self.model(obs_for_model, action_seq)
             map_aux = None
         elif self.map4d_mlp_token:
             obs_for_model = self._policy_obs(obs)
-            map4d_seq = obs['map4d']  # (B, T, N, 12)
-            map4d_flat = map4d_seq.flatten(start_dim=1)  # (B, T*N*12)
+            map4d_seq = obs['map4d']
+            map4d_flat = map4d_seq.flatten(start_dim=1)
             obs_for_model['map4d_feature'] = self.map4d_mlp(map4d_flat)  # (B, feature_dim)
             a_hat, (mu, logvar), encoder_memory = self.model(obs_for_model, action_seq)
             map_aux = None
@@ -791,15 +782,16 @@ class Agent(nn.Module):
 
         # Add future prediction auxiliary loss (raw_concat + aux_loss mode)
         if self.map4d_aux_loss and 'future_map4d' in obs:
-            future_map4d = obs['future_map4d']  # (B, H, N, 12)
-            current_map4d = obs['map4d'][:, -1]  # (B, N, 12)
-            # Position: predict delta (subtraction is valid for positions)
-            gt_future_pos = future_map4d[..., 3:6]   # (B, H, N, 3)
-            current_pos = current_map4d[:, :, 3:6].unsqueeze(1)  # (B, 1, N, 3)
-            gt_delta_pos = gt_future_pos - current_pos  # (B, H, N, 3)
-            # Rotation: predict absolute future rotation 6D (avoid delta subtraction bug)
-            gt_future_rot = future_map4d[..., 6:12]  # (B, H, N, 6)
-            gt_target = torch.cat([gt_delta_pos, gt_future_rot], dim=-1).flatten(start_dim=1)  # (B, H*N*9)
+            future_map4d = obs['future_map4d']
+            current_map4d = obs['map4d'][:, -1]
+            size_end = self.map4d_size_end
+            position_end = self.map4d_position_end
+            rotation_end = self.map4d_rotation_end
+            gt_future_pos = future_map4d[..., size_end:position_end]
+            current_pos = current_map4d[..., size_end:position_end].unsqueeze(1)
+            gt_delta_pos = gt_future_pos - current_pos
+            gt_future_rot = future_map4d[..., position_end:rotation_end]
+            gt_target = torch.cat([gt_delta_pos, gt_future_rot], dim=-1).flatten(start_dim=1)
             # Cross-attention readout from full encoder memory
             readout = self._aux_readout(encoder_memory)
             pred_future = self.future_pred_head(readout)
@@ -828,8 +820,11 @@ class Agent(nn.Module):
         if self.map4d_as_tokens:
             obs_for_model = self._policy_obs(obs)
             map4d_seq = obs['map4d']
-            B, T, N, D = map4d_seq.shape
-            obs_for_model['map4d_tokens'] = map4d_seq.reshape(B, T * N, D)
+            if map4d_seq.dim() == 3:
+                obs_for_model['map4d_tokens'] = map4d_seq
+            else:
+                B, T, N, D = map4d_seq.shape
+                obs_for_model['map4d_tokens'] = map4d_seq.reshape(B, T * N, D)
             a_hat, (_, _), _ = self.model(obs_for_model)
         elif self.map4d_mlp_token:
             obs_for_model = self._policy_obs(obs)
@@ -877,6 +872,12 @@ def save_ckpt(run_name, tag):
 
 if __name__ == "__main__":
     args = tyro.cli(Args)
+    _configure_map4d_args_from_metadata(args)
+    if args.use_map4d and not (args.map4d_raw_concat or args.map4d_as_tokens or args.map4d_mlp_token):
+        raise NotImplementedError(
+            "JSON variable-size Map4D parameters are currently supported in ACT through "
+            "--map4d-raw-concat, --map4d-as-tokens, or --map4d-mlp-token."
+        )
 
     if args.exp_name is None:
         args.exp_name = os.path.basename(__file__)[: -len(".py")]

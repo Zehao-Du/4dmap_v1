@@ -3,6 +3,10 @@ from .map_constructor import (
     Map4dConstructor,
     Map4dSingleFrameConstructor,
     ObjectConstructionResult,
+    ParameterEstimator_SingleFrame,
+    ParameterEstimator_SingleFrame_Segmentation,
+)
+from .utils import (
     build_stackcube_template_map,
     instantiate_stackcube_map,
     instantiate_stackcube_map_sequence,
@@ -26,6 +30,8 @@ __all__ = [
     "Map4dSingleFrameConstructor",
     "ManiSkillGTMap4dConstructor",
     "ObjectConstructionResult",
+    "ParameterEstimator_SingleFrame",
+    "ParameterEstimator_SingleFrame_Segmentation",
     "PointNetEncoder",
     "STRUCTURAL_MAP_CLASS_VOCAB",
     "STRUCTURAL_PARAM_DIM_VOCAB",

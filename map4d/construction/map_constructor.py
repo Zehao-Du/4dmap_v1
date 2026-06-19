@@ -4,9 +4,65 @@ import copy
 import pathlib
 import sys
 from dataclasses import dataclass
+from collections import OrderedDict
 from typing import Any, Mapping, Optional
 
 import numpy as np
+import torch
+import torch.nn as nn
+
+try:
+    from .utils import (
+        apply_structural_params_to_map,
+        as_depth_float32,
+        as_depth_frames_float32,
+        as_mask_bool,
+        as_rgb_frames_uint8,
+        as_rgb_uint8,
+        camera_intrinsics_for_frame,
+        build_template_map_for_class,
+        copy_map_attributes,
+        default_parameter_values_for_task,
+        feature_dim_from_encoder,
+        load_map_metadata_for_task,
+        lookup_by_object_key,
+        map_pose_tensors,
+        map_dims_from_metadata,
+        masked_point_cloud_from_depth,
+        normalize_actor_states,
+        object_prompt,
+        pose_parameters_from_actor_states,
+        repeat_parameter_tensor,
+        sample_point_cloud,
+        scalar_from_tensor_like,
+        split_structural_estimator_output,
+    )
+except ImportError:
+    from utils import (
+        apply_structural_params_to_map,
+        as_depth_float32,
+        as_depth_frames_float32,
+        as_mask_bool,
+        as_rgb_frames_uint8,
+        as_rgb_uint8,
+        camera_intrinsics_for_frame,
+        build_template_map_for_class,
+        copy_map_attributes,
+        default_parameter_values_for_task,
+        feature_dim_from_encoder,
+        load_map_metadata_for_task,
+        lookup_by_object_key,
+        map_pose_tensors,
+        map_dims_from_metadata,
+        masked_point_cloud_from_depth,
+        normalize_actor_states,
+        object_prompt,
+        pose_parameters_from_actor_states,
+        repeat_parameter_tensor,
+        sample_point_cloud,
+        scalar_from_tensor_like,
+        split_structural_estimator_output,
+    )
 
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -17,17 +73,239 @@ if str(_MAPS4D_DIR) not in sys.path:
     sys.path.insert(0, str(_MAPS4D_DIR))
 
 
-STACKCUBE_GT_SIZES_MANISKILL_XYZ = (
-    0.04,
-    0.04,
-    0.04,
-    0.04,
-    0.04,
-    0.04,
-    1.2090764,
-    2.4178784,
-    0.91964292762787,
-)
+from maniskill_stackcube import Map4d_StackCube
+from maniskill_plugcharger import Map4d_PlugCharger
+
+class ParameterEstimator_SingleFrame(nn.Module):
+    """
+    Single-frame structural map estimator.
+    Input: single frame point cloud
+    Output: 4d map
+    """
+
+    def __init__(
+        self,
+        point_cloud_encoder: nn.Module,
+        task_name: str,
+        map_class: Optional[type],
+        device: str = "cuda:0",
+    ):
+        super().__init__()
+        if map_class is None:
+            raise ValueError("map_class must be provided.")
+        task_metadata = load_map_metadata_for_task(task_name)
+        self.map_name = task_name
+        self.dims = map_dims_from_metadata(task_metadata)
+        self.device = device
+        self.MapClass = map_class
+        self.map_metadata = task_metadata
+        self.clip_encoder = None
+        self.point_cloud_encoder = point_cloud_encoder
+        self.estimation_head = nn.Sequential(
+            nn.Linear(feature_dim_from_encoder(point_cloud_encoder), self.dims["total"]),
+        )
+
+    def _build_scene_map(self, parameters: torch.Tensor, *, preprocess: bool):
+        sizes = parameters[:, 0:self.dims["size_end"]]
+        positions = parameters[:, self.dims["size_end"]:self.dims["position_end"]]
+        rotations = parameters[:, self.dims["position_end"]:self.dims["rotation_end"]]
+        return self.MapClass(sizes, positions, rotations, self.clip_encoder, preprocess=preprocess)
+
+    def forward(self, point_cloud):
+        if not isinstance(point_cloud, torch.Tensor):
+            point_cloud = torch.as_tensor(point_cloud, dtype=torch.float32, device=self.device)
+        else:
+            point_cloud = point_cloud.to(self.device, dtype=torch.float32)
+        features = self.point_cloud_encoder(point_cloud)
+        parameters = self.estimation_head(features)
+        scene_map = self._build_scene_map(parameters, preprocess=False)
+        scene_map.pred_map_parameters = parameters
+        return scene_map
+
+
+class ParameterEstimator_SingleFrame_Segmentation(ParameterEstimator_SingleFrame):
+    """MapPolicy-style RGB-D estimator with text-prompt segmentation.
+
+    The segmentation backend follows the local Grounded-SAM2 loader API. When
+    camera intrinsics are unavailable, masked depth is projected into a simple
+    normalized image-plane point cloud so the forward path remains usable for
+    smoke tests.
+    """
+
+    def __init__(
+        self,
+        point_cloud_encoder: nn.Module,
+        task_name: str = "StackCube-v1",
+        map_class: Optional[type] = None,
+        grounded_sam2_loader=None,
+        camera_intrinsics=None,
+        num_points: int = 1024,
+        device: str = "cuda:0",
+    ):
+        super().__init__(
+            point_cloud_encoder=point_cloud_encoder,
+            task_name=task_name,
+            map_class=map_class,
+            device=device,
+        )
+        self.grounded_sam2_loader = grounded_sam2_loader
+        self.camera_intrinsics = camera_intrinsics
+        self.num_points = int(num_points)
+        self.subgraph_dict = self._build_subgraph_dict()
+
+    def _build_subgraph_dict(self):
+        template_map = build_template_map_for_class(self.MapClass, task_name=self.map_name, device=self.device)
+        if hasattr(template_map, "Subgraph_Prompts") and template_map.Subgraph_Prompts is not None:
+            subgraph_dict = OrderedDict()
+            for i, item in enumerate(template_map.Subgraph_Prompts):
+                subgraph_dict[f"subgraph_{i}"] = {
+                    "text_prompt": item["text_prompt"],
+                    "node_indices": item["node_indices"],
+                }
+            return subgraph_dict
+
+        subgraph_dict = OrderedDict()
+        for i, obj in enumerate(getattr(template_map, "Objects", [])):
+            subgraph_dict[f"subgraph_{i}"] = {
+                "text_prompt": object_prompt(obj, i),
+                "node_indices": [i],
+            }
+        return subgraph_dict
+
+    @staticmethod
+    def _to_numpy(x):
+        if isinstance(x, torch.Tensor):
+            x = x.detach().cpu().numpy()
+        return np.asarray(x)
+
+    def _prepare_segmentation_inputs(self, rgb, depth):
+        rgb_np = self._to_numpy(rgb)
+        depth_np = self._to_numpy(depth)
+
+        if rgb_np.ndim == 3:
+            if rgb_np.shape[0] in (1, 3) and rgb_np.shape[-1] not in (1, 3):
+                rgb_np = np.moveaxis(rgb_np, 0, -1)
+            rgb_np = rgb_np[None, ...]
+        elif rgb_np.ndim == 4:
+            if rgb_np.shape[1] in (1, 3) and rgb_np.shape[-1] not in (1, 3):
+                rgb_np = np.moveaxis(rgb_np, 1, -1)
+        else:
+            raise ValueError(f"Unsupported rgb shape: {rgb_np.shape}")
+
+        if depth_np.ndim == 2:
+            depth_np = depth_np[None, ...]
+        elif depth_np.ndim == 4:
+            if depth_np.shape[1] == 1:
+                depth_np = depth_np[:, 0]
+            elif depth_np.shape[-1] == 1:
+                depth_np = depth_np[..., 0]
+            else:
+                raise ValueError(f"Unsupported depth shape: {depth_np.shape}")
+        elif depth_np.ndim != 3:
+            raise ValueError(f"Unsupported depth shape: {depth_np.shape}")
+
+        if rgb_np.shape[0] != depth_np.shape[0]:
+            raise ValueError(f"RGB/depth batch mismatch: {rgb_np.shape} vs {depth_np.shape}")
+        return rgb_np, depth_np
+
+    def _segment_single_sample(self, rgb_sample, depth_sample, camera_intrinsics=None):
+        if self.grounded_sam2_loader is None:
+            raise ValueError("grounded_sam2_loader is required for segmentation forward.")
+
+        rgb_sample = as_rgb_uint8(rgb_sample)
+        depth_sample = as_depth_float32(depth_sample)
+        subgraph_items = list(self.subgraph_dict.items())
+        text_prompts = [item[1]["text_prompt"] for item in subgraph_items]
+        segmented = self.grounded_sam2_loader.predict_prompts(rgb_sample, text_prompts, allow_empty=True)
+
+        masks_dict = OrderedDict()
+        partial_point_cloud_dict = OrderedDict()
+        merged_partial_point_clouds = []
+        for subgraph_index, (subgraph_name, subgraph_info) in enumerate(subgraph_items):
+            mask = segmented.masks[subgraph_index].astype(bool)
+            masks_dict[subgraph_name] = mask
+            partial_pc = self._point_cloud_from_depth_mask(depth_sample, mask, camera_intrinsics)
+            partial_point_cloud_dict[subgraph_name] = partial_pc
+            if partial_pc.shape[0] > 0:
+                merged_partial_point_clouds.append(partial_pc)
+
+        if merged_partial_point_clouds:
+            merged_pc = np.concatenate(merged_partial_point_clouds, axis=0)
+        else:
+            merged_pc = np.zeros((1, 3), dtype=np.float32)
+        encoded_pc = self._prepare_point_cloud_for_encoder(merged_pc)
+        return encoded_pc, masks_dict, partial_point_cloud_dict
+
+    @staticmethod
+    def _point_cloud_from_depth_mask(depth, mask, camera_intrinsics=None):
+        if camera_intrinsics is not None:
+            return masked_point_cloud_from_depth(
+                depth,
+                mask,
+                np.asarray(camera_intrinsics, dtype=np.float32),
+            )
+
+        valid = mask.astype(bool) & np.isfinite(depth) & (depth > 0)
+        v, u = np.nonzero(valid)
+        if len(u) == 0:
+            return np.zeros((0, 3), dtype=np.float32)
+        h, w = depth.shape
+        x = (u.astype(np.float32) / max(w - 1, 1)) * 2.0 - 1.0
+        y = (v.astype(np.float32) / max(h - 1, 1)) * 2.0 - 1.0
+        z = depth[v, u].astype(np.float32)
+        return np.stack([x, y, z], axis=1).astype(np.float32)
+
+    def _prepare_point_cloud_for_encoder(self, points_xyz: np.ndarray):
+        points_xyz = np.asarray(points_xyz, dtype=np.float32)
+        if points_xyz.ndim != 2 or points_xyz.shape[1] != 3:
+            raise ValueError(f"Expected point cloud shape [N, 3], got {points_xyz.shape}")
+        if points_xyz.shape[0] == 0:
+            points_xyz = np.zeros((1, 3), dtype=np.float32)
+
+        replace = points_xyz.shape[0] < self.num_points
+        idx = np.random.choice(points_xyz.shape[0], self.num_points, replace=replace)
+        points_xyz = points_xyz[idx]
+        return torch.from_numpy(points_xyz).unsqueeze(0).to(self.device)
+
+    def extract_segmented_point_cloud_batch(self, rgb, depth, camera_intrinsics=None, keep_debug: bool = False):
+        rgb_np, depth_np = self._prepare_segmentation_inputs(rgb, depth)
+        K = self.camera_intrinsics if camera_intrinsics is None else camera_intrinsics
+
+        batched_point_clouds = []
+        all_masks_dict = []
+        all_partial_point_cloud_dict = []
+        for sample_idx in range(rgb_np.shape[0]):
+            sample_K = camera_intrinsics_for_frame(K, sample_idx) if K is not None else None
+            encoded_pc, masks_dict, partial_point_cloud_dict = self._segment_single_sample(
+                rgb_np[sample_idx],
+                depth_np[sample_idx],
+                sample_K,
+            )
+            batched_point_clouds.append(encoded_pc)
+            all_masks_dict.append(masks_dict)
+            all_partial_point_cloud_dict.append(partial_point_cloud_dict)
+
+        if keep_debug:
+            self.latest_masks_dict = all_masks_dict[0] if len(all_masks_dict) == 1 else all_masks_dict
+            self.latest_partial_point_cloud_dict = (
+                all_partial_point_cloud_dict[0]
+                if len(all_partial_point_cloud_dict) == 1
+                else all_partial_point_cloud_dict
+            )
+
+        return torch.cat(batched_point_clouds, dim=0)
+
+    def forward_precomputed_point_cloud(self, point_cloud):
+        return super().forward(point_cloud)
+
+    def forward(self, rgb, depth, camera_intrinsics=None):
+        point_cloud = self.extract_segmented_point_cloud_batch(
+            rgb,
+            depth,
+            camera_intrinsics=camera_intrinsics,
+            keep_debug=True,
+        )
+        return self.forward_precomputed_point_cloud(point_cloud)
 
 
 @dataclass
@@ -117,13 +395,13 @@ class Map4dConstructor:
         foundationpose_refine_iter: int = 3,
     ):
         map4d = self._resolve_map_template(map_template)
-        rgb_np = self._as_rgb_uint8(rgb)
-        depth_np = self._as_depth_float32(depth)
+        rgb_np = as_rgb_uint8(rgb)
+        depth_np = as_depth_float32(depth)
         if rgb_np.shape[:2] != depth_np.shape[:2]:
             raise ValueError(f"RGB/depth shape mismatch: rgb={rgb_np.shape}, depth={depth_np.shape}")
 
         objects = list(getattr(map4d, "Objects", []))
-        prompts = [self._object_prompt(obj, idx) for idx, obj in enumerate(objects)]
+        prompts = [object_prompt(obj, idx) for idx, obj in enumerate(objects)]
         mask_info = self._segment_first_frame(rgb_np, objects, prompts, object_masks or {})
         point_clouds, structural_params = self._estimate_and_apply_structure(
             map4d=map4d,
@@ -132,7 +410,7 @@ class Map4dConstructor:
             camera_intrinsics=camera_intrinsics,
         )
         objects = list(getattr(map4d, "Objects", []))
-        prompts = [self._object_prompt(obj, idx) for idx, obj in enumerate(objects)]
+        prompts = [object_prompt(obj, idx) for idx, obj in enumerate(objects)]
 
         object_meshes = object_meshes or {}
         results = []
@@ -168,15 +446,9 @@ class Map4dConstructor:
                     masked_point_cloud=point_clouds[object_index] if point_clouds is not None else None,
                     structural_params=structural_params,
                 )
-            )
+        )
 
         self._attach_common_outputs(map4d, rgb_np, depth_np, camera_intrinsics, results)
-        self._save_foundationpose_pose_visualizations(
-            rgb=rgb_np,
-            camera_intrinsics=camera_intrinsics,
-            results=results,
-            frame_tag="frame",
-        )
         return map4d
 
     def instantiate_sequence(
@@ -200,13 +472,13 @@ class Map4dConstructor:
             raise ValueError("grounded_sam2_loader is required for sequence construction.")
 
         map4d = self._resolve_map_template(map_template)
-        rgb_np = self._as_rgb_frames_uint8(rgb_frames)
-        depth_np = self._as_depth_frames_float32(depth_frames)
+        rgb_np = as_rgb_frames_uint8(rgb_frames)
+        depth_np = as_depth_frames_float32(depth_frames)
         if rgb_np.shape[:3] != depth_np.shape[:3]:
             raise ValueError(f"RGB/depth sequence shape mismatch: rgb={rgb_np.shape}, depth={depth_np.shape}")
 
         objects = list(getattr(map4d, "Objects", []))
-        prompts = [self._object_prompt(obj, idx) for idx, obj in enumerate(objects)]
+        prompts = [object_prompt(obj, idx) for idx, obj in enumerate(objects)]
         tracked = self.grounded_sam2_loader.track_prompts(
             rgb_np,
             prompts,
@@ -220,7 +492,7 @@ class Map4dConstructor:
         )
 
         first_masks = [tracked.masks[start_frame_idx, idx] for idx in range(len(objects))]
-        first_K = None if camera_intrinsics is None else self._camera_intrinsics_for_frame(camera_intrinsics, start_frame_idx)
+        first_K = None if camera_intrinsics is None else camera_intrinsics_for_frame(camera_intrinsics, start_frame_idx)
         point_clouds, structural_params = self._estimate_and_apply_structure(
             map4d=map4d,
             depth=depth_np[start_frame_idx],
@@ -228,7 +500,7 @@ class Map4dConstructor:
             camera_intrinsics=first_K,
         )
         objects = list(getattr(map4d, "Objects", []))
-        prompts = [self._object_prompt(obj, idx) for idx, obj in enumerate(objects)]
+        prompts = [object_prompt(obj, idx) for idx, obj in enumerate(objects)]
 
         object_meshes = object_meshes or {}
         results = []
@@ -280,18 +552,6 @@ class Map4dConstructor:
         map4d.grounded_sam2_result = tracked
         map4d.structural_params = structural_params
         map4d.object_point_clouds = point_clouds
-        self._save_foundationpose_pose_visualizations(
-            rgb=rgb_np[start_frame_idx],
-            camera_intrinsics=first_K,
-            results=results,
-            frame_tag=f"frame_{start_frame_idx:06d}",
-        )
-        self._save_foundationpose_pose_videos(
-            rgb_frames=rgb_np,
-            camera_intrinsics=camera_intrinsics,
-            results=results,
-            fps=8,
-        )
         return map4d
 
     def _resolve_map_template(self, map_template):
@@ -302,13 +562,13 @@ class Map4dConstructor:
 
     def _segment_first_frame(self, rgb: np.ndarray, objects: list[Any], prompts: list[str], object_masks: Mapping[Any, Any]):
         manual_masks = [
-            self._lookup_by_object_key(object_masks, obj, object_index, prompts[object_index])
+            lookup_by_object_key(object_masks, obj, object_index, prompts[object_index])
             for object_index, obj in enumerate(objects)
         ]
         if all(mask is not None for mask in manual_masks):
             return [
                 {
-                    "mask": self._as_mask_bool(mask, rgb.shape[:2], prompts[idx]),
+                    "mask": as_mask_bool(mask, rgb.shape[:2], prompts[idx]),
                     "box_xyxy": None,
                     "grounding_score": None,
                     "sam_score": None,
@@ -338,28 +598,26 @@ class Map4dConstructor:
             raise ValueError("camera_intrinsics is required when structural_parameter_estimator is provided.")
 
         K = np.asarray(camera_intrinsics, dtype=np.float32)
-        object_point_clouds = [self._masked_point_cloud_from_depth(depth, mask, K) for mask in masks]
+        object_point_clouds = [masked_point_cloud_from_depth(depth, mask, K) for mask in masks]
         valid_clouds = [cloud for cloud in object_point_clouds if cloud.shape[0] > 0]
         if not valid_clouds:
             raise ValueError("No valid depth points inside any object mask; cannot estimate structural parameters.")
 
         merged = np.concatenate(valid_clouds, axis=0).astype(np.float32)
-        sampled = self._sample_point_cloud(merged, self.structural_num_points)
-        structural_params = self._run_structural_estimator(sampled)
-        if not self._rebuild_map_from_structural_params(map4d, structural_params):
-            self._apply_structural_params_to_map(map4d, structural_params)
+        sampled = sample_point_cloud(merged, self.structural_num_points, self.rng)
+        estimator_output = self._run_structural_estimator(sampled)
+        scene_map, structural_params = split_structural_estimator_output(estimator_output)
+        if scene_map is not None:
+            copy_map_attributes(map4d, scene_map)
+        elif structural_params is not None:
+            if not self._rebuild_map_from_structural_params(map4d, structural_params):
+                apply_structural_params_to_map(map4d, structural_params)
         map4d.structural_params = structural_params
         map4d.object_point_clouds = object_point_clouds
         map4d.masked_point_cloud = sampled
         return object_point_clouds, structural_params
 
-    def _run_structural_estimator(self, point_cloud: np.ndarray) -> np.ndarray:
-        import torch
-        try:
-            from .structural_parameter_estimator import estimate_structural_parameters
-        except ImportError:
-            from structural_parameter_estimator import estimate_structural_parameters
-
+    def _run_structural_estimator(self, point_cloud: np.ndarray):
         model = self.structural_parameter_estimator
         try:
             param = next(model.parameters())
@@ -367,8 +625,13 @@ class Map4dConstructor:
         except StopIteration:
             device = torch.device(self.device if torch.cuda.is_available() and str(self.device).startswith("cuda") else "cpu")
         points = torch.as_tensor(point_cloud[None], dtype=torch.float32, device=device)
-        params = estimate_structural_parameters(model, points)
-        return params.detach().cpu().numpy().astype(np.float32)
+        was_training = getattr(model, "training", False)
+        model.eval()
+        with torch.no_grad():
+            output = model(points)
+        if was_training:
+            model.train()
+        return output
 
     def _rebuild_map_from_structural_params(self, map4d, structural_params: np.ndarray) -> bool:
         model = self.structural_parameter_estimator
@@ -381,93 +644,13 @@ class Map4dConstructor:
             device = param.device
             dtype = param.dtype
             params = torch.as_tensor(structural_params, dtype=dtype, device=device)
-            positions, rotations = self._map_pose_tensors(map4d, dtype=dtype, device=device)
+            positions, rotations = map_pose_tensors(map4d, dtype=dtype, device=device)
             rebuilt = model.build_map_from_params(params, positions=positions, rotations=rotations, clip_model=None)
         except Exception:
             return False
 
-        for attr in ("Objects", "objects", "Nodes", "Node", "Edges", "Edge", "object_node_slices", "Subgraph_Prompts"):
-            if hasattr(rebuilt, attr):
-                setattr(map4d, attr, getattr(rebuilt, attr))
+        copy_map_attributes(map4d, rebuilt)
         return True
-
-    @staticmethod
-    def _map_pose_tensors(map4d, *, dtype, device):
-        import torch
-
-        positions = []
-        rotations = []
-        for obj in getattr(map4d, "Objects", []):
-            nodes = getattr(obj, "Nodes", [])
-            if len(nodes) == 0:
-                continue
-            node = nodes[0]
-            positions.append(torch.as_tensor(node.position, dtype=dtype, device=device))
-            rotations.append(torch.as_tensor(node.rotation, dtype=dtype, device=device))
-        if len(positions) == 0:
-            return None, None
-        return torch.cat(positions, dim=1), torch.cat(rotations, dim=1)
-
-    def _apply_structural_params_to_map(self, map4d, structural_params: np.ndarray) -> None:
-        params = np.asarray(structural_params, dtype=np.float32)
-        if params.ndim != 2 or params.shape[0] < 1:
-            raise ValueError(f"Expected structural_params shape [B, D], got {params.shape}")
-
-        objects = list(getattr(map4d, "Objects", []))
-        expected_dim = len(objects) * 3
-        if params.shape[1] < expected_dim:
-            raise ValueError(f"structural_params dim {params.shape[1]} is too small for {len(objects)} objects.")
-
-        for object_index, obj in enumerate(objects):
-            nodes = getattr(obj, "Nodes", [])
-            if len(nodes) == 0:
-                continue
-            node = nodes[0]
-            height, length, width = params[0, object_index * 3 : object_index * 3 + 3]
-            self._set_tensor_like_scalar(node, "height", height)
-            self._set_tensor_like_scalar(node, "top_length", length)
-            self._set_tensor_like_scalar(node, "top_width", width)
-            if hasattr(node, "bottom_length"):
-                self._set_tensor_like_scalar(node, "bottom_length", length)
-            if hasattr(node, "bottom_width"):
-                self._set_tensor_like_scalar(node, "bottom_width", width)
-            if hasattr(node, "back_height"):
-                self._set_tensor_like_scalar(node, "back_height", height)
-
-    @staticmethod
-    def _set_tensor_like_scalar(obj, attr: str, value: float) -> None:
-        current = getattr(obj, attr)
-        if hasattr(current, "new_full"):
-            setattr(obj, attr, current.new_full(current.shape, float(value)))
-        else:
-            setattr(obj, attr, float(value))
-
-    @staticmethod
-    def _masked_point_cloud_from_depth(depth: np.ndarray, mask: np.ndarray, camera_intrinsics: np.ndarray) -> np.ndarray:
-        if camera_intrinsics.shape != (3, 3):
-            raise ValueError(f"Expected camera_intrinsics shape [3, 3], got {camera_intrinsics.shape}")
-        valid = mask.astype(bool) & np.isfinite(depth) & (depth > 0)
-        v, u = np.nonzero(valid)
-        if len(u) == 0:
-            return np.zeros((0, 3), dtype=np.float32)
-        z = depth[v, u].astype(np.float32)
-        fx, fy = float(camera_intrinsics[0, 0]), float(camera_intrinsics[1, 1])
-        cx, cy = float(camera_intrinsics[0, 2]), float(camera_intrinsics[1, 2])
-        x = (u.astype(np.float32) - cx) * z / fx
-        y = (v.astype(np.float32) - cy) * z / fy
-        return np.stack([x, y, z], axis=1).astype(np.float32)
-
-    def _sample_point_cloud(self, points: np.ndarray, num_points: int) -> np.ndarray:
-        points = np.asarray(points, dtype=np.float32)
-        if points.ndim != 2 or points.shape[1] != 3:
-            raise ValueError(f"Expected point cloud shape [N, 3], got {points.shape}")
-        if points.shape[0] == 0:
-            raise ValueError("Cannot sample an empty point cloud.")
-        if num_points <= 0 or points.shape[0] == num_points:
-            return points
-        replace = points.shape[0] < num_points
-        indices = self.rng.choice(points.shape[0], size=num_points, replace=replace)
-        return points[indices].astype(np.float32)
 
     def _maybe_register_pose(
         self,
@@ -580,7 +763,7 @@ class Map4dConstructor:
             glctx=self._glctx,
         )
         poses = np.full((rgb_frames.shape[0], 4, 4), np.nan, dtype=np.float32)
-        start_K = self._camera_intrinsics_for_frame(camera_intrinsics, start_frame_idx)
+        start_K = camera_intrinsics_for_frame(camera_intrinsics, start_frame_idx)
         start_pose = estimator.register(
             K=start_K,
             rgb=rgb_frames[start_frame_idx],
@@ -590,7 +773,7 @@ class Map4dConstructor:
         )
         poses[start_frame_idx] = np.asarray(start_pose, dtype=np.float32)
         for frame_idx in range(start_frame_idx + 1, rgb_frames.shape[0]):
-            K = self._camera_intrinsics_for_frame(camera_intrinsics, frame_idx)
+            K = camera_intrinsics_for_frame(camera_intrinsics, frame_idx)
             pose = estimator.track_one(
                 rgb=rgb_frames[frame_idx],
                 depth=depth_frames[frame_idx],
@@ -607,7 +790,7 @@ class Map4dConstructor:
         return self.foundationpose_debug_dir / f"{object_index:02d}_{safe_prompt}"
 
     def _resolve_object_mesh(self, obj, object_index: int, prompt: str, object_meshes: Mapping[Any, Any]):
-        mesh = self._lookup_by_object_key(object_meshes, obj, object_index, prompt)
+        mesh = lookup_by_object_key(object_meshes, obj, object_index, prompt)
         if mesh is not None:
             return mesh
         return self._mesh_from_first_box_node(obj)
@@ -621,9 +804,9 @@ class Map4dConstructor:
             return None
         import trimesh
 
-        height = self._scalar_from_tensor_like(node.height)
-        length = self._scalar_from_tensor_like(node.top_length)
-        width = self._scalar_from_tensor_like(node.top_width)
+        height = scalar_from_tensor_like(node.height)
+        length = scalar_from_tensor_like(node.top_length)
+        width = scalar_from_tensor_like(node.top_width)
         mesh = trimesh.creation.box(extents=(length, height, width))
         mesh.vertices = np.asarray(mesh.vertices, dtype=np.float32)
         mesh.faces = np.asarray(mesh.faces, dtype=np.int64)
@@ -648,466 +831,127 @@ class Map4dConstructor:
         if camera_intrinsics is not None:
             map4d.camera_intrinsics = np.asarray(camera_intrinsics, dtype=np.float32)
 
-    def _save_foundationpose_pose_visualizations(
-        self,
-        *,
-        rgb: np.ndarray,
-        camera_intrinsics,
-        results: list[ObjectConstructionResult],
-        frame_tag: str,
-    ) -> None:
-        if self.foundationpose_loader is None or self.foundationpose_debug_dir is None or camera_intrinsics is None:
-            return
-        drawable_results = [result for result in results if result.pose_6d is not None and result.mesh is not None]
-        if not drawable_results:
-            return
-        try:
-            draw_posed_3d_box, draw_xyz_axis = self._load_foundationpose_draw_utils()
-            import imageio.v2 as imageio
-            from PIL import Image, ImageDraw
-        except Exception as exc:
-            warning_path = self.foundationpose_debug_dir / "pose_visualization_error.txt"
-            warning_path.parent.mkdir(parents=True, exist_ok=True)
-            warning_path.write_text(f"Failed to import FoundationPose drawing utilities: {exc}\n", encoding="utf-8")
-            return
-
-        output_dir = self.foundationpose_debug_dir / "pose_visualizations"
-        output_dir.mkdir(parents=True, exist_ok=True)
-        K = np.asarray(camera_intrinsics, dtype=np.float32)
-        combined = rgb.copy()
-        colors = self._pose_colors()
-        for result in drawable_results:
-            color = colors[result.object_index % len(colors)]
-            object_overlay = rgb.copy()
-            pose_for_box, bbox, axis_scale = self._pose_visualization_geometry(result.pose_6d, result.mesh)
-            object_overlay = draw_posed_3d_box(K, img=object_overlay, ob_in_cam=pose_for_box, bbox=bbox, line_color=color, linewidth=2)
-            object_overlay = draw_xyz_axis(
-                object_overlay,
-                ob_in_cam=pose_for_box,
-                scale=axis_scale,
-                K=K,
-                thickness=2,
-                transparency=0,
-                is_input_rgb=True,
-            )
-            combined = draw_posed_3d_box(K, img=combined, ob_in_cam=pose_for_box, bbox=bbox, line_color=color, linewidth=2)
-            combined = draw_xyz_axis(
-                combined,
-                ob_in_cam=pose_for_box,
-                scale=axis_scale,
-                K=K,
-                thickness=2,
-                transparency=0,
-                is_input_rgb=True,
-            )
-            object_overlay = self._draw_pose_label(object_overlay, result.prompt, result.pose_6d, color)
-            safe_prompt = "".join(ch if ch.isalnum() else "_" for ch in result.prompt).strip("_") or f"object_{result.object_index}"
-            imageio.imwrite(output_dir / f"{frame_tag}_object_{result.object_index:02d}_{safe_prompt}_pose.png", object_overlay)
-        combined = self._draw_pose_legend(combined, drawable_results, colors)
-        imageio.imwrite(output_dir / f"{frame_tag}_foundationpose_poses.png", combined)
-
-    def _save_foundationpose_pose_videos(
-        self,
-        *,
-        rgb_frames: np.ndarray,
-        camera_intrinsics,
-        results: list[ObjectConstructionResult],
-        fps: int = 8,
-    ) -> None:
-        if self.foundationpose_loader is None or self.foundationpose_debug_dir is None or camera_intrinsics is None:
-            return
-        drawable_results = [result for result in results if result.poses_6d is not None and result.mesh is not None]
-        if not drawable_results:
-            return
-        try:
-            draw_posed_3d_box, draw_xyz_axis = self._load_foundationpose_draw_utils()
-            import imageio.v2 as imageio
-        except Exception as exc:
-            warning_path = self.foundationpose_debug_dir / "pose_video_error.txt"
-            warning_path.parent.mkdir(parents=True, exist_ok=True)
-            warning_path.write_text(f"Failed to import pose video utilities: {exc}\n", encoding="utf-8")
-            return
-
-        output_dir = self.foundationpose_debug_dir / "pose_visualizations"
-        output_dir.mkdir(parents=True, exist_ok=True)
-        colors = self._pose_colors()
-        combined_frames = []
-        per_object_frames = {result.object_index: [] for result in drawable_results}
-        for frame_idx, rgb in enumerate(rgb_frames):
-            K = self._camera_intrinsics_for_frame(camera_intrinsics, frame_idx)
-            combined = rgb.copy()
-            visible_results = []
-            for result in drawable_results:
-                pose = np.asarray(result.poses_6d[frame_idx], dtype=np.float32)
-                if not np.isfinite(pose).all():
-                    continue
-                visible_results.append(result)
-                color = colors[result.object_index % len(colors)]
-                pose_for_box, bbox, axis_scale = self._pose_visualization_geometry(pose, result.mesh)
-                object_overlay = rgb.copy()
-                object_overlay = draw_posed_3d_box(K, img=object_overlay, ob_in_cam=pose_for_box, bbox=bbox, line_color=color, linewidth=2)
-                object_overlay = draw_xyz_axis(
-                    object_overlay,
-                    ob_in_cam=pose_for_box,
-                    scale=axis_scale,
-                    K=K,
-                    thickness=2,
-                    transparency=0,
-                    is_input_rgb=True,
-                )
-                object_overlay = self._draw_pose_label(object_overlay, result.prompt, pose, color)
-                per_object_frames[result.object_index].append(object_overlay)
-                combined = draw_posed_3d_box(K, img=combined, ob_in_cam=pose_for_box, bbox=bbox, line_color=color, linewidth=2)
-                combined = draw_xyz_axis(
-                    combined,
-                    ob_in_cam=pose_for_box,
-                    scale=axis_scale,
-                    K=K,
-                    thickness=2,
-                    transparency=0,
-                    is_input_rgb=True,
-                )
-            combined_frames.append(self._draw_pose_legend(combined, visible_results, colors))
-        self._write_video(output_dir / "sequence_foundationpose_poses.mp4", combined_frames, fps=fps, imageio=imageio)
-        for result in drawable_results:
-            safe_prompt = "".join(ch if ch.isalnum() else "_" for ch in result.prompt).strip("_") or f"object_{result.object_index}"
-            self._write_video(
-                output_dir / f"sequence_object_{result.object_index:02d}_{safe_prompt}_pose.mp4",
-                per_object_frames[result.object_index],
-                fps=fps,
-                imageio=imageio,
-            )
-
-    @staticmethod
-    def _write_video(path: pathlib.Path, frames: list[np.ndarray], *, fps: int, imageio) -> None:
-        if frames:
-            imageio.mimsave(path, [np.asarray(frame, dtype=np.uint8) for frame in frames], fps=fps, macro_block_size=1)
-
-    def _load_foundationpose_draw_utils(self):
-        try:
-            from Utils import draw_posed_3d_box, draw_xyz_axis
-        except Exception:
-            foundationpose_root = getattr(self.foundationpose_loader, "foundationpose_root", None)
-            if foundationpose_root is not None and str(foundationpose_root) not in sys.path:
-                sys.path.insert(0, str(foundationpose_root))
-            from Utils import draw_posed_3d_box, draw_xyz_axis
-        return draw_posed_3d_box, draw_xyz_axis
-
-    @staticmethod
-    def _pose_visualization_geometry(pose_6d: np.ndarray, mesh):
-        import trimesh
-
-        pose = np.asarray(pose_6d, dtype=np.float32)
-        to_origin, extents = trimesh.bounds.oriented_bounds(mesh)
-        bbox = np.stack([-extents / 2.0, extents / 2.0], axis=0).astype(np.float32)
-        pose_for_box = pose @ np.linalg.inv(to_origin).astype(np.float32)
-        axis_scale = float(np.clip(np.max(extents) * 0.35, 0.03, 0.12))
-        return pose_for_box, bbox, axis_scale
-
-    @staticmethod
-    def _draw_pose_label(image: np.ndarray, prompt: str, pose_6d: np.ndarray, color: tuple[int, int, int]) -> np.ndarray:
-        from PIL import Image, ImageDraw
-
-        xyz = np.asarray(pose_6d, dtype=np.float32)[:3, 3]
-        text = f"{prompt}: t=({xyz[0]:.3f},{xyz[1]:.3f},{xyz[2]:.3f})m"
-        pil = Image.fromarray(image)
-        draw = ImageDraw.Draw(pil)
-        draw.rectangle([4, 4, min(pil.width - 1, 4 + 8 * len(text)), 24], fill=(0, 0, 0))
-        draw.text((8, 7), text, fill=color)
-        return np.asarray(pil)
-
-    @staticmethod
-    def _draw_pose_legend(image: np.ndarray, results: list[ObjectConstructionResult], colors: list[tuple[int, int, int]]) -> np.ndarray:
-        from PIL import Image, ImageDraw
-
-        pil = Image.fromarray(image)
-        draw = ImageDraw.Draw(pil)
-        row_h = 18
-        width = min(pil.width - 1, 250)
-        height = min(pil.height - 1, 6 + row_h * len(results))
-        draw.rectangle([4, 4, width, height], fill=(0, 0, 0))
-        for row, result in enumerate(results):
-            color = colors[result.object_index % len(colors)]
-            y = 7 + row * row_h
-            draw.rectangle([8, y + 3, 18, y + 13], fill=color)
-            draw.text((24, y), result.prompt, fill=color)
-        return np.asarray(pil)
-
-    @staticmethod
-    def _pose_colors() -> list[tuple[int, int, int]]:
-        return [
-            (255, 64, 64),
-            (64, 220, 64),
-            (64, 144, 255),
-            (255, 192, 64),
-            (220, 64, 255),
-        ]
-
-    @staticmethod
-    def _lookup_by_object_key(mapping: Mapping[Any, Any], obj, object_index: int, prompt: str):
-        for key in (object_index, prompt, getattr(obj, "prompt", None), getattr(obj, "Object_Prompt", None), obj.__class__.__name__):
-            if key is not None and key in mapping:
-                return mapping[key]
-        return None
-
-    @staticmethod
-    def _object_prompt(obj, object_index: int) -> str:
-        for attr in ("prompt", "Object_Prompt", "semantic"):
-            value = getattr(obj, attr, None)
-            if value is not None and str(value).strip() != "":
-                return str(value).strip()
-        return f"object_{object_index}"
-
-    @staticmethod
-    def _camera_intrinsics_for_frame(camera_intrinsics, frame_idx: int) -> np.ndarray:
-        K = np.asarray(camera_intrinsics, dtype=np.float32)
-        return K[frame_idx] if K.ndim == 3 else K
-
-    @staticmethod
-    def _as_rgb_uint8(rgb) -> np.ndarray:
-        rgb_np = np.asarray(rgb)
-        if rgb_np.ndim != 3 or rgb_np.shape[-1] not in (3, 4):
-            raise ValueError(f"Expected rgb shape [H, W, 3/4], got {rgb_np.shape}")
-        if rgb_np.shape[-1] == 4:
-            rgb_np = rgb_np[..., :3]
-        if np.issubdtype(rgb_np.dtype, np.floating):
-            if float(np.nanmax(rgb_np)) <= 1.0:
-                rgb_np = rgb_np * 255.0
-            rgb_np = np.clip(rgb_np, 0, 255)
-        return rgb_np.astype(np.uint8)
-
-    @classmethod
-    def _as_rgb_frames_uint8(cls, rgb_frames) -> np.ndarray:
-        arr = np.asarray(rgb_frames)
-        if arr.ndim == 3:
-            arr = arr[None, ...]
-        if arr.ndim != 4:
-            raise ValueError(f"Expected rgb_frames shape [T, H, W, 3/4], got {arr.shape}")
-        return np.stack([cls._as_rgb_uint8(frame) for frame in arr], axis=0)
-
-    @staticmethod
-    def _as_depth_float32(depth) -> np.ndarray:
-        depth_np = np.asarray(depth)
-        if depth_np.ndim == 3 and depth_np.shape[-1] == 1:
-            depth_np = depth_np[..., 0]
-        if depth_np.ndim != 2:
-            raise ValueError(f"Expected depth shape [H, W] or [H, W, 1], got {depth_np.shape}")
-        depth_np = depth_np.astype(np.float32)
-        if np.nanmax(depth_np) > 100.0:
-            depth_np = depth_np / 1000.0
-        return depth_np
-
-    @classmethod
-    def _as_depth_frames_float32(cls, depth_frames) -> np.ndarray:
-        arr = np.asarray(depth_frames)
-        if arr.ndim == 2:
-            arr = arr[None, ...]
-        if arr.ndim == 3 or (arr.ndim == 4 and arr.shape[-1] == 1):
-            return np.stack([cls._as_depth_float32(frame) for frame in arr], axis=0)
-        raise ValueError(f"Expected depth_frames shape [T, H, W] or [T, H, W, 1], got {arr.shape}")
-
-    @staticmethod
-    def _as_mask_bool(mask, image_hw: tuple[int, int], prompt: str) -> np.ndarray:
-        mask_np = np.asarray(mask)
-        if mask_np.ndim == 3 and mask_np.shape[-1] == 1:
-            mask_np = mask_np[..., 0]
-        if mask_np.shape != image_hw:
-            raise ValueError(f"Mask for prompt={prompt!r} has shape {mask_np.shape}, expected {image_hw}")
-        return mask_np.astype(bool)
-
-    @staticmethod
-    def _scalar_from_tensor_like(value) -> float:
-        if hasattr(value, "detach"):
-            value = value.detach().cpu().numpy()
-        arr = np.asarray(value, dtype=np.float32).reshape(-1)
-        return float(arr[0])
-
-
 class Map4dSingleFrameConstructor(Map4dConstructor):
     """Explicit single-frame constructor name."""
 
-
 class ManiSkillGTMap4dConstructor:
-    """Build StackCube 4D maps directly from ManiSkill actor GT states."""
+    """Build ManiSkill 4D maps directly from actor GT states."""
+
+    MAP_CLASSES = {
+        "StackCube-v1": Map4d_StackCube,
+        "PlugCharger-v1": Map4d_PlugCharger,
+    }
 
     def __init__(
         self,
         *,
-        task_name: str = "StackCube-v1",
-        actor_names: tuple[str, str, str] = ("cubeA", "cubeB", "table-workspace"),
-        sizes: tuple[float, ...] = STACKCUBE_GT_SIZES_MANISKILL_XYZ,
-        device: str = "cpu",
+        task_name: str,
+        device: str,
     ):
-        if task_name != "StackCube-v1":
-            raise ValueError("ManiSkillGTMap4dConstructor currently supports StackCube-v1 only.")
-        if len(actor_names) != 3:
-            raise ValueError("actor_names must be (red_cube_actor, green_cube_actor, desk_actor).")
-        if len(sizes) != 9:
-            raise ValueError("sizes must contain 9 values: 3 per object.")
+        # get map class, pose parameters functions from task name
+        if task_name not in self.MAP_CLASSES:
+            raise ValueError(f"Unsupported ManiSkill GT map task {task_name!r}. Available: {sorted(self.MAP_CLASSES)}")
+        map_class = self.MAP_CLASSES[task_name]
+
+        # get metadata from task name
+        task_metadata = load_map_metadata_for_task(task_name)
+        size_parameters, relation_parameters = default_parameter_values_for_task(task_name)
+        actor_names = tuple(task_metadata.get("actor_names", ()))
+
+        # check actor name dimensions
+        if len(actor_names) == 0:
+            raise ValueError(f"Task {task_name!r} metadata must define actor_names.")
+
         self.task_name = task_name
+        self.map_class = map_class
         self.actor_names = tuple(actor_names)
-        self.sizes = tuple(float(v) for v in sizes)
+        self.size_parameters = tuple(float(v) for v in size_parameters)
+        self.relation_parameters = tuple(float(v) for v in relation_parameters)
+        self.task_metadata = task_metadata
         self.device = device
+        self.actor_states = None
 
-    def construct_from_h5(self, h5_path, *, traj_key: str = "traj_0", frame_indices=None):
-        import h5py
+    def build_map_train(self):
+        pose_parameters = self._parameters_train()
+        return self._build_map_from_parameters(pose_parameters)
 
-        with h5py.File(h5_path, "r") as f:
-            if traj_key not in f:
-                raise KeyError(f"Trajectory {traj_key!r} not found in {h5_path}")
-            return self.construct_from_group(f[traj_key], frame_indices=frame_indices)
+    def build_map_test(self):
+        pose_parameters = self._parameters_test()
+        return self._build_map_from_parameters(pose_parameters)
 
-    def construct_from_group(self, traj_group, *, frame_indices=None):
-        actors = traj_group["env_states"]["actors"]
-        states = [np.asarray(actors[name], dtype=np.float32) for name in self.actor_names]
-        return self.construct_from_actor_states(*states, frame_indices=frame_indices)
+    def parameters_train(self, actor_states=None, *, frame_indices=None):
+        return self._parameters_train(actor_states=actor_states, frame_indices=frame_indices)
 
-    def construct_from_actor_states(self, red_cube_state, green_cube_state, desk_state, *, frame_indices=None):
-        import torch
-
-        actor_states = [np.asarray(state, dtype=np.float32) for state in (red_cube_state, green_cube_state, desk_state)]
-        if frame_indices is not None:
-            actor_states = [state[frame_indices] for state in actor_states]
-        actor_states = [state[None] if state.ndim == 1 else state for state in actor_states]
-        frame_count = actor_states[0].shape[0]
-        if any(state.shape[0] != frame_count for state in actor_states):
-            raise ValueError("All actor state arrays must have the same frame count.")
-
-        sizes = torch.tensor([self.sizes], dtype=torch.float32, device=self.device).repeat(frame_count, 1)
-        positions = torch.as_tensor(
-            np.concatenate([state[:, 0:3] for state in actor_states], axis=1),
-            dtype=torch.float32,
-            device=self.device,
+    def parameters_test(
+        self,
+        actor_states=None,
+        *,
+        frame_indices=None,
+        sizes: Optional[tuple[float, ...]] = None,
+        relation_parameters: Optional[tuple[float, ...]] = None,
+    ):
+        return self._parameters_test(
+            actor_states=actor_states,
+            frame_indices=frame_indices,
+            sizes=sizes,
+            relation_parameters=relation_parameters,
         )
-        rotations = torch.as_tensor(
-            np.concatenate([_quat_wxyz_to_rotation_6d(state[:, 3:7]) for state in actor_states], axis=1),
-            dtype=torch.float32,
-            device=self.device,
+
+    def _build_map_from_parameters(self, parameters):
+        map4d = self.map_class(
+            parameters["positions"],
+            parameters["rotations"],
+            parameters["size_parameters"],
+            parameters["relation_parameters"],
         )
-        map4d = build_stackcube_template_map(sizes=sizes, positions=positions, rotations=rotations, device=self.device)
-        map4d.gt_actor_names = self.actor_names
-        map4d.gt_actor_states = actor_states
         return map4d
 
+    ##################################### Parameters #####################################
+    def _parameters_train(self, actor_states=None, *, frame_indices=None):
+        """Use JSON size/relation parameters and H5 actor-state poses."""
 
-def build_stackcube_template_map(*, sizes=None, positions=None, rotations=None, device: str = "cpu"):
-    import torch
-    from maniskill_stackcube import Map4d_StackCube
+        actor_states = self._resolve_actor_states(actor_states, frame_indices=frame_indices)
+        positions, rotations = pose_parameters_from_actor_states(actor_states, device=self.device)
+        frame_count = actor_states[0].shape[0]
+        return {
+            "size_parameters": repeat_parameter_tensor(self.size_parameters, frame_count, device=self.device),
+            "relation_parameters": repeat_parameter_tensor(self.relation_parameters, frame_count, device=self.device),
+            "positions": positions,
+            "rotations": rotations,
+        }
 
-    if sizes is None:
-        sizes = torch.tensor(
-            [STACKCUBE_GT_SIZES_MANISKILL_XYZ],
-            dtype=torch.float32,
-            device=device,
-        )
-    positions = torch.zeros((1, 9), dtype=torch.float32, device=device) if positions is None else positions
-    if rotations is None:
-        rotations = torch.zeros((1, 18), dtype=torch.float32, device=device)
-        for i in range(3):
-            rotations[:, i * 6 : (i + 1) * 6] = torch.tensor(
-                [1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
-                dtype=torch.float32,
-                device=device,
-            )
-    return Map4d_StackCube(sizes, positions, rotations, clip_model=None, preprocess=False)
+    def _parameters_test(
+        self,
+        actor_states=None,
+        *,
+        frame_indices=None,
+        sizes: Optional[tuple[float, ...]] = None,
+        relation_parameters: Optional[tuple[float, ...]] = None,
+    ):
+        """Build size/relation/pose parameters for test-time GT maps."""
 
+        actor_states = self._resolve_actor_states(actor_states, frame_indices=frame_indices)
+        positions, rotations = pose_parameters_from_actor_states(actor_states, device=self.device)
+        frame_count = actor_states[0].shape[0]
+        return {
+            "size_parameters": repeat_parameter_tensor(
+                self.size_parameters if sizes is None else sizes,
+                frame_count,
+                device=self.device,
+            ),
+            "relation_parameters": repeat_parameter_tensor(
+                self.relation_parameters if relation_parameters is None else relation_parameters,
+                frame_count,
+                device=self.device,
+            ),
+            "positions": positions,
+            "rotations": rotations,
+        }
 
-def _quat_wxyz_to_rotation_6d(quat_wxyz: np.ndarray) -> np.ndarray:
-    quat = np.asarray(quat_wxyz, dtype=np.float32)
-    if quat.ndim != 2 or quat.shape[1] != 4:
-        raise ValueError(f"Expected quaternion shape [T, 4], got {quat.shape}")
-    quat = quat / np.linalg.norm(quat, axis=1, keepdims=True).clip(min=1e-8)
-    w, x, y, z = quat[:, 0], quat[:, 1], quat[:, 2], quat[:, 3]
-    matrix = np.empty((quat.shape[0], 3, 3), dtype=np.float32)
-    matrix[:, 0, 0] = 1.0 - 2.0 * (y * y + z * z)
-    matrix[:, 0, 1] = 2.0 * (x * y - z * w)
-    matrix[:, 0, 2] = 2.0 * (x * z + y * w)
-    matrix[:, 1, 0] = 2.0 * (x * y + z * w)
-    matrix[:, 1, 1] = 1.0 - 2.0 * (x * x + z * z)
-    matrix[:, 1, 2] = 2.0 * (y * z - x * w)
-    matrix[:, 2, 0] = 2.0 * (x * z - y * w)
-    matrix[:, 2, 1] = 2.0 * (y * z + x * w)
-    matrix[:, 2, 2] = 1.0 - 2.0 * (x * x + y * y)
-    return np.concatenate([matrix[:, :, 0], matrix[:, :, 1]], axis=1).astype(np.float32)
-
-
-def instantiate_stackcube_map(
-    *,
-    rgb,
-    depth,
-    camera_intrinsics=None,
-    object_masks: Optional[Mapping[Any, Any]] = None,
-    object_meshes: Optional[Mapping[Any, Any]] = None,
-    grounded_sam2_loader=None,
-    foundationpose_loader=None,
-    structural_parameter_estimator=None,
-    structural_num_points: int = 2048,
-    device: str = "cuda:0",
-    foundationpose_debug: int = 0,
-    foundationpose_debug_dir: Optional[pathlib.Path | str] = None,
-):
-    constructor = Map4dSingleFrameConstructor(
-        map_template=build_stackcube_template_map(device="cpu"),
-        grounded_sam2_loader=grounded_sam2_loader,
-        foundationpose_loader=foundationpose_loader,
-        structural_parameter_estimator=structural_parameter_estimator,
-        structural_num_points=structural_num_points,
-        device=device,
-        foundationpose_debug=foundationpose_debug,
-        foundationpose_debug_dir=foundationpose_debug_dir,
-    )
-    return constructor.construct(
-        rgb=rgb,
-        depth=depth,
-        camera_intrinsics=camera_intrinsics,
-        object_masks=object_masks,
-        object_meshes=object_meshes,
-    )
-
-
-def instantiate_stackcube_map_sequence(
-    *,
-    rgb_frames,
-    depth_frames,
-    camera_intrinsics=None,
-    object_meshes: Optional[Mapping[Any, Any]] = None,
-    grounded_sam2_loader=None,
-    foundationpose_loader=None,
-    structural_parameter_estimator=None,
-    structural_num_points: int = 2048,
-    device: str = "cuda:0",
-    foundationpose_debug: int = 0,
-    foundationpose_debug_dir: Optional[pathlib.Path | str] = None,
-    box_threshold: float = 0.25,
-    text_threshold: float = 0.3,
-    select_by: str = "grounding_score",
-    allow_empty: bool = False,
-    start_frame_idx: int = 0,
-    max_frame_num_to_track: Optional[int] = None,
-    tracking_frames_dir: Optional[pathlib.Path | str] = None,
-    foundationpose_refine_iter: int = 3,
-):
-    constructor = Map4dConstructor(
-        map_template=build_stackcube_template_map(device="cpu"),
-        grounded_sam2_loader=grounded_sam2_loader,
-        foundationpose_loader=foundationpose_loader,
-        structural_parameter_estimator=structural_parameter_estimator,
-        structural_num_points=structural_num_points,
-        device=device,
-        foundationpose_debug=foundationpose_debug,
-        foundationpose_debug_dir=foundationpose_debug_dir,
-    )
-    return constructor.instantiate_sequence(
-        rgb_frames=rgb_frames,
-        depth_frames=depth_frames,
-        camera_intrinsics=camera_intrinsics,
-        object_meshes=object_meshes,
-        box_threshold=box_threshold,
-        text_threshold=text_threshold,
-        select_by=select_by,
-        allow_empty=allow_empty,
-        start_frame_idx=start_frame_idx,
-        max_frame_num_to_track=max_frame_num_to_track,
-        tracking_frames_dir=tracking_frames_dir,
-        foundationpose_refine_iter=foundationpose_refine_iter,
-    )
+    ##################################### Helpers #####################################
+    def _resolve_actor_states(self, actor_states=None, *, frame_indices=None) -> list[np.ndarray]:
+        if actor_states is None:
+            if self.actor_states is None:
+                raise ValueError("actor_states must be set before building a ManiSkill GT map.")
+            actor_states = self.actor_states
+        return normalize_actor_states(actor_states, self.actor_names, frame_indices=frame_indices)
