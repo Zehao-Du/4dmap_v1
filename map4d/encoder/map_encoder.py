@@ -18,6 +18,34 @@ TYPE_VOCAB = {
     "Alignment": 6,
 }
 
+
+def _canonical_quaternion_wxyz(quat, eps=1e-8):
+    quat = quat / quat.norm(dim=-1, keepdim=True).clamp_min(eps)
+    sign = torch.where(quat[..., :1] < 0.0, -1.0, 1.0).to(device=quat.device, dtype=quat.dtype)
+    return quat * sign
+
+
+def _relative_quaternion_wxyz(src_quat, dst_quat):
+    if src_quat.shape[-1] != 4 or dst_quat.shape[-1] != 4:
+        raise ValueError(
+            f"Expected quaternion_wxyz rotations with last dim 4, got {src_quat.shape} and {dst_quat.shape}"
+        )
+    src_quat = _canonical_quaternion_wxyz(src_quat)
+    dst_quat = _canonical_quaternion_wxyz(dst_quat)
+    sw, sx, sy, sz = src_quat.unbind(dim=-1)
+    dw, dx, dy, dz = dst_quat.unbind(dim=-1)
+    aw, ax, ay, az = sw, -sx, -sy, -sz
+    rel = torch.stack(
+        [
+            aw * dw - ax * dx - ay * dy - az * dz,
+            aw * dx + ax * dw + ay * dz - az * dy,
+            aw * dy - ax * dz + ay * dw + az * dx,
+            aw * dz + ax * dy - ay * dx + az * dw,
+        ],
+        dim=-1,
+    )
+    return _canonical_quaternion_wxyz(rel)
+
 def _normalize_semantic_label(label):
     return " ".join(str(label).strip().lower().split())
 
@@ -206,10 +234,10 @@ def _edge_pose(edge, nodes, batch_size, device, dtype):
         pose = _to_tensor(pose, device=device, dtype=dtype)
         if pose.ndim == 1:
             pose = pose.unsqueeze(0).expand(batch_size, -1)
-        if pose.shape[-1] < 9:
-            pad = torch.zeros(batch_size, 9 - pose.shape[-1], device=device, dtype=dtype)
+        if pose.shape[-1] < 7:
+            pad = torch.zeros(batch_size, 7 - pose.shape[-1], device=device, dtype=dtype)
             pose = torch.cat([pose, pad], dim=-1)
-        return pose[..., :9]
+        return pose[..., :7]
 
     src_idx, dst_idx = getattr(edge, "Node_idx", (0, 0))
     src = nodes[src_idx]
@@ -219,10 +247,8 @@ def _edge_pose(edge, nodes, batch_size, device, dtype):
     src_rot = _to_tensor(getattr(src, "rotation"), device=device, dtype=dtype)
     dst_rot = _to_tensor(getattr(dst, "rotation"), device=device, dtype=dtype)
     rel_pos = dst_pos - src_pos
-    rel_rot = dst_rot - src_rot
-    if rel_rot.shape[-1] < 6:
-        rel_rot = F.pad(rel_rot, (0, 6 - rel_rot.shape[-1]))
-    return torch.cat([rel_pos, rel_rot[..., :6]], dim=-1)
+    rel_rot = _relative_quaternion_wxyz(src_rot, dst_rot)
+    return torch.cat([rel_pos, rel_rot], dim=-1)
 
 
 def _edge_anchor(edge, nodes, batch_size, device, dtype):
@@ -366,12 +392,9 @@ def build_map4d_graph_data(map4d, semantic_vocab=None, complete_graph=True):
             rel_pos = _to_tensor(getattr(dst_node, "position"), device=device, dtype=dtype) - _to_tensor(
                 getattr(src_node, "position"), device=device, dtype=dtype
             )
-            rel_rot = _to_tensor(getattr(dst_node, "rotation"), device=device, dtype=dtype) - _to_tensor(
-                getattr(src_node, "rotation"), device=device, dtype=dtype
-            )
-            if rel_rot.shape[-1] < 6:
-                rel_rot = F.pad(rel_rot, (0, 6 - rel_rot.shape[-1]))
-            edge_pose = torch.cat([rel_pos, rel_rot[..., :6]], dim=-1)
+            src_rot = _to_tensor(getattr(src_node, "rotation"), device=device, dtype=dtype)
+            dst_rot = _to_tensor(getattr(dst_node, "rotation"), device=device, dtype=dtype)
+            edge_pose = torch.cat([rel_pos, _relative_quaternion_wxyz(src_rot, dst_rot)], dim=-1)
         else:
             edge_type = _edge_type_id(edge)
             if torch.is_tensor(edge_type):
@@ -395,13 +418,13 @@ def build_map4d_graph_data(map4d, semantic_vocab=None, complete_graph=True):
         edge_type = torch.stack(edge_type_chunks, dim=1).reshape(-1, 1)
         edge_param = torch.stack(edge_param_chunks, dim=1).reshape(-1, 3)
         edge_anchor = torch.stack(edge_anchor_chunks, dim=1).reshape(-1, 24)
-        edge_pose = torch.stack(edge_pose_chunks, dim=1).reshape(-1, 9)
+        edge_pose = torch.stack(edge_pose_chunks, dim=1).reshape(-1, 7)
     else:
         edge_index = torch.empty(2, 0, device=device, dtype=torch.long)
         edge_type = torch.empty(0, 1, device=device, dtype=torch.long)
         edge_param = torch.empty(0, 3, device=device, dtype=dtype)
         edge_anchor = torch.empty(0, 24, device=device, dtype=dtype)
-        edge_pose = torch.empty(0, 9, device=device, dtype=dtype)
+        edge_pose = torch.empty(0, 7, device=device, dtype=dtype)
 
     batch = torch.arange(batch_size, device=device).repeat_interleave(num_nodes_per_graph)
     payload = dict(
@@ -482,7 +505,7 @@ class PointNetFeatureExtractor(nn.Module):
 
 
 class RoboNodeEncoder(nn.Module):
-    def __init__(self, sem_dim=512, hidden_dim=768, semantic_vocab_size=None, pose_dim=9):
+    def __init__(self, sem_dim=512, hidden_dim=768, semantic_vocab_size=None, pose_dim=7):
         super().__init__()
         self.pos_encoder = PointNetFeatureExtractor(input_dim=3, hidden_dim=64, out_dim=hidden_dim)
         self.aff_encoder = PointNetFeatureExtractor(input_dim=3, hidden_dim=64, out_dim=hidden_dim)
@@ -521,12 +544,12 @@ class RoboNodeEncoder(nn.Module):
 
 
 class RoboEdgeEncoder(nn.Module):
-    def __init__(self, hidden_dim=768, num_edge_types=10):
+    def __init__(self, hidden_dim=768, num_edge_types=10, pose_dim=7):
         super().__init__()
         self.type_embed = nn.Embedding(num_edge_types, hidden_dim)
         self.param_proj = nn.Linear(3, hidden_dim)
         self.anchor_proj = nn.Linear(24, hidden_dim)
-        self.pose_proj = nn.Linear(9, hidden_dim)
+        self.pose_proj = nn.Linear(pose_dim, hidden_dim)
         self.fusion = nn.Sequential(
             nn.Linear(hidden_dim * 4, hidden_dim),
             nn.LayerNorm(hidden_dim),

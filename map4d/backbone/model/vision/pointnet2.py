@@ -255,7 +255,15 @@ class PointNet2DenseEncoder(nn.Module):
         super(PointNet2DenseEncoder, self).__init__()
         
         self.sa1 = PointNetSetAbstraction(npoint=npoint1, radius=0.04, nsample=32, in_channel=in_channels, mlp=[64, 64, 128], group_all=False,bn=True)
-        self.sa2 = PointNetSetAbstraction(npoint=npoint2, radius=0.08, nsample=64, in_channel=128+3, mlp=[128, 128, 288], group_all=False,bn=True)
+        self.sa2 = PointNetSetAbstraction(
+            npoint=npoint2,
+            radius=0.08,
+            nsample=64,
+            in_channel=128 + 3,
+            mlp=[128, 128, out_channels],
+            group_all=False,
+            bn=True,
+        )
         
         # copy variables
         self.in_channels = in_channels

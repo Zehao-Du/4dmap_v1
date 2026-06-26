@@ -12,9 +12,9 @@ except ModuleNotFoundError:
     from peract_keyframes import future_keyframes  # type: ignore
 
 
-MAP4D_DIT_TARGET_FORMAT = "map4d_dit_local_delta_relative_rotation_v1"
+MAP4D_DIT_TARGET_FORMAT = "map4d_dit_local_delta_relative_quaternion_v1"
 MAP4D_DIT_TCP_POS_GRIPPER_TARGET_FORMAT = (
-    "map4d_dit_local_delta_relative_rotation_tcp_pos_gripper_v1"
+    "map4d_dit_local_delta_relative_quaternion_tcp_pos_gripper_v1"
 )
 
 
@@ -86,6 +86,19 @@ def rot6d_to_matrix_np(rot6d: np.ndarray, eps: float = 1e-8) -> np.ndarray:
     return np.stack([b1, b2, b3], axis=-1).astype(np.float32)
 
 
+def matrix_to_quat_np(matrix: np.ndarray, eps: float = 1e-8) -> np.ndarray:
+    """Convert rotation matrices to canonical WXYZ quaternions."""
+    matrix = np.asarray(matrix, dtype=np.float32)
+    m00 = matrix[..., 0, 0]
+    m11 = matrix[..., 1, 1]
+    m22 = matrix[..., 2, 2]
+    qw = np.sqrt(np.clip(1.0 + m00 + m11 + m22, eps, None)) / 2.0
+    qx = (matrix[..., 2, 1] - matrix[..., 1, 2]) / (4.0 * qw)
+    qy = (matrix[..., 0, 2] - matrix[..., 2, 0]) / (4.0 * qw)
+    qz = (matrix[..., 1, 0] - matrix[..., 0, 1]) / (4.0 * qw)
+    return canonicalize_quaternion_np(np.stack([qw, qx, qy, qz], axis=-1))
+
+
 def relative_quaternion_np(current: np.ndarray, future: np.ndarray) -> np.ndarray:
     """Return canonical relative WXYZ quaternion from current to future."""
     current = canonicalize_quaternion_np(current)
@@ -118,7 +131,7 @@ def gather_keyframe_targets(
     """Gather object-state and TCP targets for keyframe future loss.
 
     Args:
-        map4d: `[T, N, 12]`, with `size(3), position(3), rotation_6d(6)`.
+        map4d: legacy `[T, N, 12]`, with `size(3), position(3), rotation_6d(6)`.
         tcp_pose: `[T, tcp_dim]`.
         future_keyframe_table: `[T, H]` or `[B, H]` indices into frame time.
 
@@ -153,13 +166,17 @@ def gather_keyframe_targets(
 
 
 def _pose_map4d_parts(map4d: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    """Return object positions and rot6d from supported Map4D tensor layouts."""
+    """Return object positions and WXYZ quaternions from supported Map4D layouts."""
     map4d = np.asarray(map4d, dtype=np.float32)
+    if map4d.shape[-1] == 7:
+        return map4d[..., 0:3], canonicalize_quaternion_np(map4d[..., 3:7])
+    if map4d.shape[-1] == 10:
+        return map4d[..., 3:6], canonicalize_quaternion_np(map4d[..., 6:10])
     if map4d.shape[-1] == 9:
-        return map4d[..., 0:3], map4d[..., 3:9]
+        return map4d[..., 0:3], matrix_to_quat_np(rot6d_to_matrix_np(map4d[..., 3:9]))
     if map4d.shape[-1] >= 12:
-        return map4d[..., 3:6], map4d[..., 6:12]
-    raise ValueError(f"Expected Map4D last dim 9 or >=12, got {map4d.shape}")
+        return map4d[..., 3:6], matrix_to_quat_np(rot6d_to_matrix_np(map4d[..., 6:12]))
+    raise ValueError(f"Expected Map4D last dim 7, 9, 10, or >=12, got {map4d.shape}")
 
 
 def gather_map4d_dit_keyframe_targets(
@@ -167,17 +184,17 @@ def gather_map4d_dit_keyframe_targets(
     tcp_pose: np.ndarray,
     future_keyframe_table: np.ndarray,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Gather Map4D DiT local-delta and relative-rotation keyframe targets.
+    """Gather Map4D DiT local-delta and relative-quaternion keyframe targets.
 
     Args:
-        map4d: `[T, N, 9]` pose-only with `position(3), rotation_6d(6)`,
-            or legacy `[T, N, 12]` with `size(3), position(3), rotation_6d(6)`.
+        map4d: `[T, N, 7]` pose-only with `position(3), quaternion_wxyz(4)`,
+            or legacy rot6d layouts `[T, N, 9]` / `[T, N, 12]`.
         tcp_pose: `[T, 7]`, with TCP `position(3), quaternion_wxyz(4)`.
         future_keyframe_table: `[T, H]` indices into frame time.
 
     Returns:
-        object_targets: `[T, H, N, 9]`, each target is
-            `local_delta_pos(3) + relative_rot6d(6)`.
+        object_targets: `[T, H, N, 7]`, each target is
+            `local_delta_pos(3) + relative_quat_wxyz(4)`.
         tcp_targets: `[T, H, 7]`, each target is
             `local_delta_pos(3) + delta_quat_wxyz(4)`.
     """
@@ -185,8 +202,8 @@ def gather_map4d_dit_keyframe_targets(
     tcp_pose = np.asarray(tcp_pose, dtype=np.float32)
     indices = np.asarray(future_keyframe_table, dtype=np.int64)
 
-    if map4d.ndim != 3 or map4d.shape[-1] not in {9, 12}:
-        raise ValueError(f"Expected map4d shape [T, N, 9] or [T, N, 12], got {map4d.shape}")
+    if map4d.ndim != 3 or map4d.shape[-1] not in {7, 9, 10, 12}:
+        raise ValueError(f"Expected map4d shape [T, N, 7/9/10/12], got {map4d.shape}")
     if tcp_pose.ndim != 2 or tcp_pose.shape[-1] < 7 or tcp_pose.shape[0] != map4d.shape[0]:
         raise ValueError(
             f"Expected tcp_pose shape [T, >=7] with T={map4d.shape[0]}, got {tcp_pose.shape}"
@@ -199,21 +216,17 @@ def gather_map4d_dit_keyframe_targets(
     indices = np.clip(indices, 0, map4d.shape[0] - 1)
     future_map4d = map4d[indices]
 
-    object_pos, object_rot6d = _pose_map4d_parts(map4d)
-    future_obj_pos, future_obj_rot6d = _pose_map4d_parts(future_map4d)
+    object_pos, object_quat = _pose_map4d_parts(map4d)
+    future_obj_pos, future_obj_quat = _pose_map4d_parts(future_map4d)
     current_obj_pos = object_pos[:, None]
-    current_obj_rot = rot6d_to_matrix_np(object_rot6d[:, None])
-    future_obj_rot = rot6d_to_matrix_np(future_obj_rot6d)
+    current_obj_rot = quat_to_matrix_np(object_quat[:, None])
     object_local_delta_pos = np.einsum(
         "...ji,...j->...i",
         current_obj_rot,
         future_obj_pos - current_obj_pos,
     )
-    object_relative_rot = np.einsum("...ji,...jk->...ik", current_obj_rot, future_obj_rot)
-    object_relative_rot6d = matrix_to_rot6d_np(object_relative_rot)
-    object_targets = np.concatenate(
-        [object_local_delta_pos, object_relative_rot6d], axis=-1
-    )
+    object_relative_quat = relative_quaternion_np(object_quat[:, None], future_obj_quat)
+    object_targets = np.concatenate([object_local_delta_pos, object_relative_quat], axis=-1)
 
     future_tcp = tcp_pose[indices]
     current_tcp_pos = tcp_pose[:, None, 0:3]
@@ -247,8 +260,8 @@ def gather_map4d_dit_pos_gripper_keyframe_targets(
     gripper = np.asarray(gripper, dtype=np.float32).reshape(-1, 1)
     indices = np.asarray(future_keyframe_table, dtype=np.int64)
 
-    if map4d.ndim != 3 or map4d.shape[-1] not in {9, 12}:
-        raise ValueError(f"Expected map4d shape [T, N, 9] or [T, N, 12], got {map4d.shape}")
+    if map4d.ndim != 3 or map4d.shape[-1] not in {7, 9, 10, 12}:
+        raise ValueError(f"Expected map4d shape [T, N, 7/9/10/12], got {map4d.shape}")
     if tcp_pose.ndim != 2 or tcp_pose.shape[-1] < 7 or tcp_pose.shape[0] != map4d.shape[0]:
         raise ValueError(
             f"Expected tcp_pose shape [T, >=7] with T={map4d.shape[0]}, got {tcp_pose.shape}"
@@ -263,21 +276,17 @@ def gather_map4d_dit_pos_gripper_keyframe_targets(
     indices = np.clip(indices, 0, map4d.shape[0] - 1)
     future_map4d = map4d[indices]
 
-    object_pos, object_rot6d = _pose_map4d_parts(map4d)
-    future_obj_pos, future_obj_rot6d = _pose_map4d_parts(future_map4d)
+    object_pos, object_quat = _pose_map4d_parts(map4d)
+    future_obj_pos, future_obj_quat = _pose_map4d_parts(future_map4d)
     current_obj_pos = object_pos[:, None]
-    current_obj_rot = rot6d_to_matrix_np(object_rot6d[:, None])
-    future_obj_rot = rot6d_to_matrix_np(future_obj_rot6d)
+    current_obj_rot = quat_to_matrix_np(object_quat[:, None])
     object_local_delta_pos = np.einsum(
         "...ji,...j->...i",
         current_obj_rot,
         future_obj_pos - current_obj_pos,
     )
-    object_relative_rot = np.einsum("...ji,...jk->...ik", current_obj_rot, future_obj_rot)
-    object_relative_rot6d = matrix_to_rot6d_np(object_relative_rot)
-    object_targets = np.concatenate(
-        [object_local_delta_pos, object_relative_rot6d], axis=-1
-    )
+    object_relative_quat = relative_quaternion_np(object_quat[:, None], future_obj_quat)
+    object_targets = np.concatenate([object_local_delta_pos, object_relative_quat], axis=-1)
 
     future_tcp = tcp_pose[indices]
     current_tcp_pos = tcp_pose[:, None, 0:3]

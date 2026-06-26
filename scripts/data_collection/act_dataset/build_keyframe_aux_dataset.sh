@@ -1,7 +1,8 @@
-#!/usr/bin/env bash
-# Build Map4D DiT sidecar data with local-delta and relative-rotation targets.
-# This intentionally uses a distinct output suffix so ACT/DP legacy sidecars are not overwritten.
-set -euo pipefail
+#!/bin/bash
+# Build sidecar data for 4.4 Raw Concat + Keyframe Future Loss + TCP targets.
+# Input format matches collect_plugcharger.sh / collect_stackcube.sh outputs.
+set -e
+set -o pipefail
 
 ROOT_DIR="${ROOT_DIR:-/data2/zehao/MAP4D}"
 POLICY_DIR="${POLICY_DIR:-${ROOT_DIR}/4dmap_v1}"
@@ -9,12 +10,12 @@ TASK_NAME="${TASK_NAME:-PlugCharger-v1}"
 FUTURE_HORIZON="${FUTURE_HORIZON:-4}"
 NUM_TRAJ="${NUM_TRAJ:-}"
 CONTROL_MODE="${CONTROL_MODE:-auto}"
+TCP_TARGET="${TCP_TARGET:-pose}"
 GRIPPER_SOURCE="${GRIPPER_SOURCE:-auto}"
 STOPPING_DELTA="${STOPPING_DELTA:-0.1}"
 MIN_SEPARATION="${MIN_SEPARATION:-1}"
 OVERWRITE="${OVERWRITE:-1}"
 NO_MATERIALIZE_TARGETS="${NO_MATERIALIZE_TARGETS:-0}"
-TARGET_FORMAT="map4d_dit_local_delta_relative_rotation_v1"
 
 if [[ "${CONDA_DEFAULT_ENV:-}" != "4dmap" && "${RUNNING_IN_4DMAP:-0}" != "1" ]]; then
   export RUNNING_IN_4DMAP=1
@@ -49,6 +50,23 @@ case "${CONTROL_MODE}" in
     ;;
 esac
 
+case "${TCP_TARGET}" in
+  pose|pos|pos_gripper)
+    ;;
+  *)
+    echo "Unsupported TCP_TARGET=${TCP_TARGET}. Use pose, pos, or pos_gripper." >&2
+    exit 1
+    ;;
+esac
+
+if [[ "${TCP_TARGET}" == "pose" ]]; then
+  TARGET_FORMAT="object_delta_pos_rot6d_plus_tcp_pose"
+elif [[ "${TCP_TARGET}" == "pos" ]]; then
+  TARGET_FORMAT="object_delta_pos_rot6d_plus_tcp_pos"
+else
+  TARGET_FORMAT="object_delta_pos_rot6d_plus_tcp_pos_gripper"
+fi
+
 if [[ $# -ge 1 ]]; then
   DEMO_PATH="$1"
 else
@@ -65,20 +83,25 @@ else
     for mode in "${DEFAULT_CONTROL_MODES[@]}"; do
       echo "  tried: ${DATASET_DIR}/${TRAJ_NAME}.rgb.${mode}.physx_cpu.filtered.h5" >&2
     done
-    echo "Pass an explicit DEMO_PATH as arg 1, or collect/filter demos first." >&2
+    echo "Run scripts/data_collection/dp_dataset/collect_plugcharger.sh first, or pass an explicit DEMO_PATH as arg 1." >&2
     exit 1
   fi
 fi
 
 if [[ ! -f "${DEMO_PATH}" ]]; then
   echo "Demo file not found: ${DEMO_PATH}" >&2
+  echo "Run scripts/data_collection/dp_dataset/collect_plugcharger.sh first, or pass DEMO_PATH as arg 1." >&2
   exit 1
 fi
 
 if [[ $# -ge 2 ]]; then
   OUTPUT_PATH="$2"
+elif [[ "${TCP_TARGET}" == "pose" ]]; then
+  OUTPUT_PATH="${DEMO_PATH%.h5}.keyframe_aux_h${FUTURE_HORIZON}.h5"
+elif [[ "${TCP_TARGET}" == "pos_gripper" ]]; then
+  OUTPUT_PATH="${DEMO_PATH%.h5}.keyframe_aux_tcp_pos_gripper_h${FUTURE_HORIZON}.h5"
 else
-  OUTPUT_PATH="${DEMO_PATH%.h5}.map4d_dit_h${FUTURE_HORIZON}.h5"
+  OUTPUT_PATH="${DEMO_PATH%.h5}.keyframe_aux_tcp_pos_h${FUTURE_HORIZON}.h5"
 fi
 SUMMARY_JSON="${SUMMARY_JSON:-${OUTPUT_PATH%.h5}.summary.json}"
 
@@ -89,7 +112,7 @@ cmd=(
   --summary-json "${SUMMARY_JSON}"
   --task-name "${TASK_NAME}"
   --future-horizon "${FUTURE_HORIZON}"
-  --tcp-target pose
+  --tcp-target "${TCP_TARGET}"
   --target-format "${TARGET_FORMAT}"
   --gripper-source "${GRIPPER_SOURCE}"
   --stopping-delta "${STOPPING_DELTA}"
@@ -106,13 +129,13 @@ if [[ "${NO_MATERIALIZE_TARGETS}" == "1" ]]; then
   cmd+=(--no-materialize-targets)
 fi
 
-echo "[$(date +%H:%M:%S)] Building Map4D DiT dataset sidecar"
+echo "[$(date +%H:%M:%S)] Building keyframe aux dataset"
 echo "  task: ${TASK_NAME}"
 echo "  input: ${DEMO_PATH}"
 echo "  output: ${OUTPUT_PATH}"
 echo "  summary: ${SUMMARY_JSON}"
 echo "  future_horizon: ${FUTURE_HORIZON}"
 echo "  control_mode: ${CONTROL_MODE}"
-echo "  tcp_target: pose"
+echo "  tcp_target: ${TCP_TARGET}"
 echo "  target_format: ${TARGET_FORMAT}"
 "${cmd[@]}"

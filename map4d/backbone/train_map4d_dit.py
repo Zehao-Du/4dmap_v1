@@ -172,7 +172,14 @@ class TrainMap4DDiTWorkspace:
             ema = hydra.utils.instantiate(cfg.ema, model=self.ema_model)
 
         if self.distributed:
-            self.model = DDP(self.model, device_ids=[self.local_rank] if device.type == "cuda" else None)
+            ddp_find_unused_parameters = bool(
+                OmegaConf.select(cfg, "training.ddp_find_unused_parameters", default=True)
+            )
+            self.model = DDP(
+                self.model,
+                device_ids=[self.local_rank] if device.type == "cuda" else None,
+                find_unused_parameters=ddp_find_unused_parameters,
+            )
 
         if self._rank0():
             os.makedirs(self.output_dir, exist_ok=True)
@@ -297,7 +304,8 @@ class TrainMap4DDiTWorkspace:
                 if self._rank0() and val_losses:
                     step_log["val_loss"] = float(np.mean(val_losses))
 
-            if train_sampling_batch is not None and self.epoch % int(cfg.training.sample_every) == 0:
+            sample_every = int(cfg.training.sample_every)
+            if train_sampling_batch is not None and sample_every > 0 and self.epoch % sample_every == 0:
                 eval_policy = self._policy_for_eval()
                 eval_policy.eval()
                 with torch.no_grad():
@@ -355,31 +363,28 @@ class TrainMap4DDiTWorkspace:
 
                 eval_policy = self._policy_for_eval()
                 eval_policy.eval()
-                try:
-                    env_metrics = evaluate_maniskill(
-                        eval_policy,
-                        cfg.task_name,
-                        num_eval_episodes=int(cfg.training.get("num_eval_episodes", 100)),
-                        num_eval_envs=int(cfg.training.get("num_eval_envs", 10)),
-                        n_obs_steps=int(cfg.n_obs_steps),
-                        robot_state_dim=int(cfg.robot_state_dim),
-                        size_parameter_dim=int(cfg.size_parameter_dim),
-                        relation_parameter_dim=int(cfg.relation_parameter_dim),
-                        device=device,
-                        use_rgb=False,
-                        rgb_feature_dim=int(cfg.policy.model_cfg.get("rgb_feature_dim", 384)),
-                    )
-                    print(f"[Epoch {self.epoch}] Env eval: {env_metrics}")
-                    step_log.update({f"eval/{k}": v for k, v in env_metrics.items()})
-                    if wandb_run is not None:
-                        wandb_run.log({f"eval/{k}": v for k, v in env_metrics.items()}, step=self.global_step)
-                    success_once = env_metrics.get("success_once", 0.0)
-                    if success_once > getattr(self, "_best_success_once", 0.0):
-                        self._best_success_once = success_once
-                        print(f"  New best success_once: {success_once:.4f}. Saving checkpoint.")
-                        self.save_checkpoint(tag="best_success")
-                except Exception as exc:
-                    print(f"[Epoch {self.epoch}] Env eval failed: {exc}")
+                env_metrics = evaluate_maniskill(
+                    eval_policy,
+                    cfg.task_name,
+                    num_eval_episodes=int(cfg.training.get("num_eval_episodes", 100)),
+                    num_eval_envs=int(cfg.training.get("num_eval_envs", 10)),
+                    n_obs_steps=int(cfg.n_obs_steps),
+                    robot_state_dim=int(cfg.robot_state_dim),
+                    size_parameter_dim=int(cfg.size_parameter_dim),
+                    relation_parameter_dim=int(cfg.relation_parameter_dim),
+                    device=device,
+                    use_rgb=False,
+                    rgb_feature_dim=int(cfg.policy.model_cfg.get("rgb_feature_dim", 384)),
+                )
+                print(f"[Epoch {self.epoch}] Env eval: {env_metrics}")
+                step_log.update({f"eval/{k}": v for k, v in env_metrics.items()})
+                if wandb_run is not None:
+                    wandb_run.log({f"eval/{k}": v for k, v in env_metrics.items()}, step=self.global_step)
+                success_once = env_metrics.get("success_once", 0.0)
+                if success_once > getattr(self, "_best_success_once", 0.0):
+                    self._best_success_once = success_once
+                    print(f"  New best success_once: {success_once:.4f}. Saving checkpoint.")
+                    self.save_checkpoint(tag="best_success")
 
             if self._rank0() and step_log:
                 write_local_metrics({**step_log, "record_type": "epoch"})

@@ -22,10 +22,9 @@ from helper.keyframe_targets import (
     build_future_keyframe_table,
     canonicalize_quaternion_np,
     gather_map4d_dit_keyframe_targets,
-    matrix_to_rot6d_np,
 )
 from map4d.backbone.dataset.base_dataset import BaseDataset
-from map4d.backbone.model.common.normalizer import LinearNormalizer
+from map4d.backbone.model.common.normalizer import LinearNormalizer, SingleFieldLinearNormalizer
 from map4d.representation.maps4d.metadata import (
     get_task_actor_names,
     get_task_parameter_defaults,
@@ -33,7 +32,7 @@ from map4d.representation.maps4d.metadata import (
 
 
 TASK_ACTOR_NAMES = {
-    "StackCube-v1": ("cubeA", "cubeB", "table-workspace"),
+    "StackCube-v1": ("cubeA", "cubeB"),
     "PlugCharger-v1": ("charger", "receptacle"),
 }
 
@@ -45,9 +44,6 @@ TASK_GT_SIZES = {
         0.04,
         0.04,
         0.04,
-        1.2090764,
-        2.4178784,
-        0.91964292762787,
     ),
     "PlugCharger-v1": (0.04, 0.03, 0.024, 0.02, 0.1, 0.1),
 }
@@ -85,22 +81,6 @@ def _traj_sort_key(name: str) -> int:
         return 0
 
 
-def _quat_wxyz_to_rotation_6d_np(quat_wxyz: np.ndarray) -> np.ndarray:
-    quat = canonicalize_quaternion_np(quat_wxyz)
-    w, x, y, z = np.moveaxis(quat, -1, 0)
-    matrix = np.empty((*quat.shape[:-1], 3, 3), dtype=np.float32)
-    matrix[..., 0, 0] = 1.0 - 2.0 * (y * y + z * z)
-    matrix[..., 0, 1] = 2.0 * (x * y - z * w)
-    matrix[..., 0, 2] = 2.0 * (x * z + y * w)
-    matrix[..., 1, 0] = 2.0 * (x * y + z * w)
-    matrix[..., 1, 1] = 1.0 - 2.0 * (x * x + z * z)
-    matrix[..., 1, 2] = 2.0 * (y * z - x * w)
-    matrix[..., 2, 0] = 2.0 * (x * z - y * w)
-    matrix[..., 2, 1] = 2.0 * (y * z + x * w)
-    matrix[..., 2, 2] = 1.0 - 2.0 * (x * x + y * y)
-    return matrix_to_rot6d_np(matrix)
-
-
 def _axis_angle_to_quaternion_np(axis_angle: np.ndarray) -> np.ndarray:
     """Convert axis-angle to WXYZ quaternion. Zero vectors map to identity."""
     angle = np.linalg.norm(axis_angle, axis=-1, keepdims=True).clip(min=1e-10)
@@ -131,7 +111,7 @@ def _actor_states_to_map4d_tensor(
         sizes_np = np.asarray(tuple(sizes), dtype=np.float32).reshape(num_objects, 3)
     sizes_seq = np.broadcast_to(sizes_np, (frame_count, num_objects, 3))
     positions = np.stack([state[:, 0:3] for state in states], axis=1)
-    rotations = np.stack([_quat_wxyz_to_rotation_6d_np(state[:, 3:7]) for state in states], axis=1)
+    rotations = np.stack([canonicalize_quaternion_np(state[:, 3:7]) for state in states], axis=1)
     return np.concatenate([sizes_seq, positions, rotations], axis=-1).astype(np.float32)
 
 
@@ -141,7 +121,7 @@ def _actor_states_to_pose_map4d_tensor(actor_states: Sequence[np.ndarray]) -> np
     if any(state.shape[0] != frame_count for state in states):
         raise ValueError("All actor state arrays must have the same frame count.")
     positions = np.stack([state[:, 0:3] for state in states], axis=1)
-    rotations = np.stack([_quat_wxyz_to_rotation_6d_np(state[:, 3:7]) for state in states], axis=1)
+    rotations = np.stack([canonicalize_quaternion_np(state[:, 3:7]) for state in states], axis=1)
     return np.concatenate([positions, rotations], axis=-1).astype(np.float32)
 
 
@@ -276,9 +256,10 @@ class ManiSkillMap4DDataset(BaseDataset):
         n_obs_steps: int = 2,
         num_objects: int = 3,
         robot_state_dim: int = 32,
-        map4d_dim: int = 9,
+        map4d_dim: int = 7,
         size_parameter_dim: int = 0,
         relation_parameter_dim: int = 0,
+        action_type: str = "single_arm_ee_pose",
         use_rgb: bool = True,
         use_depth: bool = False,
         rgb_feature_dim: int = 288,
@@ -312,6 +293,12 @@ class ManiSkillMap4DDataset(BaseDataset):
         self.map4d_dim = int(map4d_dim)
         self.size_parameter_dim = int(size_parameter_dim)
         self.relation_parameter_dim = int(relation_parameter_dim)
+        self.action_type = str(action_type)
+        if self.action_type not in {"single_arm_ee_pose", "single_arm_ee_pos"}:
+            raise ValueError(
+                "action_type must be 'single_arm_ee_pose' or 'single_arm_ee_pos', "
+                f"got {self.action_type!r}"
+            )
         self.use_rgb = bool(use_rgb)
         self.use_depth = bool(use_depth)
         self.rgb_feature_dim = int(rgb_feature_dim)
@@ -361,18 +348,17 @@ class ManiSkillMap4DDataset(BaseDataset):
         rng = np.random.default_rng(seed)
         trajectories = []
         identity_quat = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
-        identity_rot6d = np.array([1.0, 0.0, 0.0, 0.0, 1.0, 0.0], dtype=np.float32)
         for _ in range(episodes):
             robot_state = rng.normal(size=(length + 1, self.robot_state_dim)).astype(np.float32)
             actions = rng.normal(scale=0.05, size=(length, 8)).astype(np.float32)
             actions[:, 3:7] = identity_quat
             actions[:, 7:8] = rng.uniform(-1.0, 1.0, size=(length, 1)).astype(np.float32)
             map4d = rng.normal(scale=0.05, size=(length + 1, self.num_objects, self.map4d_dim)).astype(np.float32)
-            if self.map4d_dim == 9:
-                map4d[..., 3:9] = identity_rot6d
+            if self.map4d_dim == 7:
+                map4d[..., 3:7] = identity_quat
             else:
                 map4d[..., 0:3] = np.abs(map4d[..., 0:3]) + 0.02
-                map4d[..., 6:12] = identity_rot6d
+                map4d[..., 6:10] = identity_quat
             size_parameters = np.abs(
                 rng.normal(scale=0.05, size=(self.size_parameter_dim,))
             ).astype(np.float32)
@@ -380,9 +366,9 @@ class ManiSkillMap4DDataset(BaseDataset):
                 rng.normal(scale=0.01, size=(self.relation_parameter_dim,))
             ).astype(np.float32)
             object_targets = rng.normal(
-                scale=0.05, size=(length + 1, self.horizon_keyframe, self.num_objects, 9)
+                scale=0.05, size=(length + 1, self.horizon_keyframe, self.num_objects, self.map4d_dim)
             ).astype(np.float32)
-            object_targets[..., 3:9] = identity_rot6d
+            object_targets[..., 3:7] = identity_quat
             tcp_dim = self.keyframe_tcp_dim or 7
             tcp_targets = rng.normal(
                 scale=0.05, size=(length + 1, self.horizon_keyframe, tcp_dim)
@@ -469,6 +455,42 @@ class ManiSkillMap4DDataset(BaseDataset):
             )
         return shape
 
+    def _validate_semantic_field_source(
+        self,
+        traj: h5py.Group,
+        *,
+        length: int,
+        point_count: int,
+        map4d: np.ndarray,
+    ) -> None:
+        source = _get_dataset_node(traj, "obs/semantic_field_source/token_type")
+        if source is None:
+            return
+        if not isinstance(source, h5py.Dataset):
+            raise TypeError(f"{traj.name}/obs/semantic_field_source/token_type must be an HDF5 dataset")
+        token_type = np.asarray(source[()])
+        if token_type.shape != (length, point_count):
+            raise ValueError(
+                f"{traj.name}: token_type shape {token_type.shape} must match "
+                f"semantic field {(length, point_count)}"
+            )
+        if map4d.ndim != 3 or map4d.shape[0] != length or map4d.shape[-1] < 3:
+            raise ValueError(f"{traj.name}: map4d must be [T,N,>=3] with T={length}, got {map4d.shape}")
+        node_count = int(map4d.shape[1])
+        if point_count <= node_count:
+            raise ValueError(f"{traj.name}: point_count={point_count} must exceed num_map_nodes={node_count}")
+        if not np.all(token_type[:, : point_count - node_count] == 0):
+            raise ValueError(f"{traj.name}: RGB-D semantic field prefix token_type must be 0")
+        if not np.all(token_type[:, point_count - node_count :] == 1):
+            raise ValueError(f"{traj.name}: Map4D node-center token_type suffix must be 1")
+        point_node = _get_dataset_node(traj, self.pointcloud_path)
+        if point_node is None or not isinstance(point_node, h5py.Dataset):
+            raise KeyError(f"{traj.name} missing {self.pointcloud_path}")
+        if not np.allclose(point_node[:, -node_count:, :3], map4d[..., 0:3], atol=1e-5):
+            raise ValueError(
+                f"{traj.name}: final {node_count} semantic field xyz tokens must match map4d[...,0:3]"
+            )
+
     def _load_h5_window(
         self,
         traj_name: str,
@@ -495,6 +517,121 @@ class ManiSkillMap4DDataset(BaseDataset):
         if dtype is None:
             return np.asarray(value)
         return np.asarray(value, dtype=dtype)
+
+    def _load_h5_array(self, traj_name: str, path: str, *, dtype=np.float32) -> np.ndarray:
+        f = self._get_demo_file()
+        dataset = _get_dataset_node(f[traj_name], path)
+        if dataset is None:
+            raise KeyError(f"/{traj_name} missing {path}")
+        if not isinstance(dataset, h5py.Dataset):
+            raise TypeError(f"/{traj_name}/{path} must be an HDF5 dataset")
+        value = dataset[()]
+        if dtype is None:
+            return np.asarray(value)
+        return np.asarray(value, dtype=dtype)
+
+    def _iter_obs_arrays_for_normalizer(self, key: str, h5_path: str):
+        for traj in self.trajectories:
+            if key in traj:
+                yield np.asarray(traj[key], dtype=np.float32)
+            elif "traj_name" in traj:
+                yield self._load_h5_array(traj["traj_name"], h5_path, dtype=np.float32)
+
+    @staticmethod
+    def _fit_streaming_normalizer(
+        arrays: Iterable[np.ndarray],
+        *,
+        dtype=torch.float32,
+        mode="limits",
+        output_max=1.0,
+        output_min=-1.0,
+        range_eps=1e-4,
+        fit_offset=True,
+    ) -> SingleFieldLinearNormalizer:
+        if mode not in {"limits", "gaussian"}:
+            raise ValueError(f"Unsupported normalizer mode {mode!r}")
+        if output_max <= output_min:
+            raise ValueError("output_max must be greater than output_min")
+
+        count = 0
+        input_min = None
+        input_max = None
+        sum_x = None
+        sum_x2 = None
+        for array in arrays:
+            value = np.asarray(array, dtype=np.float64)
+            if value.ndim == 0:
+                raise ValueError("Cannot fit normalizer from a scalar array")
+            value = value.reshape(-1, value.shape[-1])
+            if value.shape[0] == 0:
+                continue
+            chunk_min = value.min(axis=0)
+            chunk_max = value.max(axis=0)
+            chunk_sum = value.sum(axis=0)
+            chunk_sum2 = np.square(value).sum(axis=0)
+            if input_min is None:
+                input_min = chunk_min
+                input_max = chunk_max
+                sum_x = chunk_sum
+                sum_x2 = chunk_sum2
+            else:
+                input_min = np.minimum(input_min, chunk_min)
+                input_max = np.maximum(input_max, chunk_max)
+                sum_x += chunk_sum
+                sum_x2 += chunk_sum2
+            count += value.shape[0]
+
+        if count == 0 or input_min is None:
+            raise ValueError("Cannot fit normalizer from empty arrays")
+
+        input_mean = sum_x / count
+        if count > 1:
+            variance = (sum_x2 - count * np.square(input_mean)) / (count - 1)
+            input_std = np.sqrt(np.maximum(variance, 0.0))
+        else:
+            input_std = np.zeros_like(input_mean)
+
+        input_min = torch.as_tensor(input_min, dtype=dtype)
+        input_max = torch.as_tensor(input_max, dtype=dtype)
+        input_mean = torch.as_tensor(input_mean, dtype=dtype)
+        input_std = torch.as_tensor(input_std, dtype=dtype)
+
+        if mode == "limits":
+            if fit_offset:
+                input_range = input_max - input_min
+                ignore_dim = input_range < range_eps
+                input_range = input_range.clone()
+                input_range[ignore_dim] = output_max - output_min
+                scale = (output_max - output_min) / input_range
+                offset = output_min - scale * input_min
+                offset[ignore_dim] = (output_max + output_min) / 2 - input_min[ignore_dim]
+            else:
+                if output_max <= 0 or output_min >= 0:
+                    raise ValueError("fit_offset=False requires output_min < 0 < output_max")
+                output_abs = min(abs(output_min), abs(output_max))
+                input_abs = torch.maximum(torch.abs(input_min), torch.abs(input_max))
+                ignore_dim = input_abs < range_eps
+                input_abs = input_abs.clone()
+                input_abs[ignore_dim] = output_abs
+                scale = output_abs / input_abs
+                offset = torch.zeros_like(input_mean)
+        else:
+            ignore_dim = input_std < range_eps
+            scale = input_std.clone()
+            scale[ignore_dim] = 1
+            scale = 1 / scale
+            offset = -input_mean * scale if fit_offset else torch.zeros_like(input_mean)
+
+        return SingleFieldLinearNormalizer.create_manual(
+            scale=scale,
+            offset=offset,
+            input_stats_dict={
+                "min": input_min,
+                "max": input_max,
+                "mean": input_mean,
+                "std": input_std,
+            },
+        )
 
     def _pointcloud_cameras(self, traj: h5py.Group) -> Tuple[str, ...]:
         raw = traj.attrs.get("pointcloud_cameras")
@@ -687,7 +824,7 @@ class ManiSkillMap4DDataset(BaseDataset):
             return None
         sizes = TASK_GT_SIZES.get(self.task_name)
         actor_states = [actors[name][()] for name in self.actor_names]
-        if self.map4d_dim == 9:
+        if self.map4d_dim == 7:
             return _actor_states_to_pose_map4d_tensor(actor_states)
         return _actor_states_to_map4d_tensor(actor_states, sizes=sizes)
 
@@ -807,6 +944,12 @@ class ManiSkillMap4DDataset(BaseDataset):
                     camera_names = None
                     if self.semantic_feature_mode == "precomputed":
                         dino_feature_shape = self._validate_dino_feature(traj, seq_len, point_cloud_shape[1])
+                        self._validate_semantic_field_source(
+                            traj,
+                            length=seq_len,
+                            point_count=point_cloud_shape[1],
+                            map4d=map4d,
+                        )
                     elif self.semantic_feature_mode == "online_dinov3":
                         camera_names = self._validate_online_dinov3_inputs(
                             traj, seq_len, point_cloud_shape[1]
@@ -839,6 +982,10 @@ class ManiSkillMap4DDataset(BaseDataset):
                         keyframe_object, keyframe_tcp = gather_map4d_dit_keyframe_targets(
                             map4d, tcp_pose, future_table
                         )
+                if keyframe_object.shape[2] != self.num_objects:
+                    raise ValueError(
+                        f"{traj_name}: expected {self.num_objects} keyframe objects, got {keyframe_object.shape[2]}"
+                    )
                 if self.keyframe_tcp_dim is not None and keyframe_tcp.shape[-1] != self.keyframe_tcp_dim:
                     raise ValueError(
                         f"{traj_name}: expected keyframe_tcp_dim={self.keyframe_tcp_dim}, "
@@ -902,7 +1049,8 @@ class ManiSkillMap4DDataset(BaseDataset):
     def get_normalizer(self, mode="limits", **kwargs) -> LinearNormalizer:
         normalizer = LinearNormalizer()
         robot_state = np.concatenate([traj["robot_state"] for traj in self.trajectories], axis=0)
-        node_poses = np.concatenate([traj["map4d"] for traj in self.trajectories], axis=0)
+        node_position = np.concatenate([traj["map4d"][..., 0:3] for traj in self.trajectories], axis=0)
+        node_rotation = np.concatenate([traj["map4d"][..., 3:7] for traj in self.trajectories], axis=0)
         size_parameters = np.stack([traj["size_parameters"] for traj in self.trajectories], axis=0)
         trajectory_pos = np.concatenate([traj["actions"][:, 0:3] for traj in self.trajectories], axis=0)
         gripper = np.concatenate([traj["actions"][:, 7:8] for traj in self.trajectories], axis=0)
@@ -916,7 +1064,7 @@ class ManiSkillMap4DDataset(BaseDataset):
         )
         fields = {
             "robot_state": robot_state,
-            "node_poses": node_poses,
+            "node_position": node_position,
             "size_parameters": size_parameters,
             "trajectory_pos": trajectory_pos,
             "gripper_openness": gripper,
@@ -939,6 +1087,30 @@ class ManiSkillMap4DDataset(BaseDataset):
             mode=mode,
             **kwargs,
         )
+        normalizer["node_rotation"] = SingleFieldLinearNormalizer.create_identity()
+        if self.use_rgb:
+            normalizer["point_cloud"] = self._fit_streaming_normalizer(
+                self._iter_obs_arrays_for_normalizer("point_cloud", self.pointcloud_path),
+                mode=mode,
+                **kwargs,
+            )
+            pc_params = normalizer.params_dict["point_cloud"]
+            xyz_norm = SingleFieldLinearNormalizer.create_manual(
+                pc_params["scale"][:3].detach().clone(),
+                pc_params["offset"][:3].detach().clone(),
+                {
+                    name: value[:3].detach().clone()
+                    for name, value in pc_params["input_stats"].items()
+                },
+            )
+            normalizer["node_position"] = xyz_norm
+            normalizer["keyframe_map4d_pos"] = xyz_norm
+            if self.semantic_feature_mode == "precomputed":
+                normalizer["dino_feature"] = self._fit_streaming_normalizer(
+                    self._iter_obs_arrays_for_normalizer("dino_feature", self.dino_feature_path),
+                    mode=mode,
+                    **kwargs,
+                )
         return normalizer
 
     def get_all_actions(self) -> torch.Tensor:
@@ -958,15 +1130,20 @@ class ManiSkillMap4DDataset(BaseDataset):
         current_idx = start
         obs_start = current_idx - self.n_obs_steps + 1
         action_seq = self._slice_with_pad(traj["actions"], start, self.horizon_action)
+        if self.action_type == "single_arm_ee_pos":
+            action_trajectory = np.concatenate([action_seq[:, 0:3], action_seq[:, 7:8]], axis=-1)
+        else:
+            action_trajectory = action_seq[:, 0:7]
         sample = {
             "obs": {
                 "robot_state": self._slice_with_pad(traj["robot_state"], obs_start, self.n_obs_steps),
-                "node_poses": self._slice_with_pad(traj["map4d"], obs_start, self.n_obs_steps),
+                "node_position": self._slice_with_pad(traj["map4d"][..., 0:3], obs_start, self.n_obs_steps),
+                "node_rotation": self._slice_with_pad(traj["map4d"][..., 3:7], obs_start, self.n_obs_steps),
                 "size_parameters": traj["size_parameters"],
                 "relation_parameters": traj["relation_parameters"],
             },
             "action": {
-                "trajectory": action_seq[:, 0:7],
+                "trajectory": action_trajectory,
                 "gripper_openness": action_seq[:, 7:8],
             },
             "keyframe": {
@@ -978,7 +1155,19 @@ class ManiSkillMap4DDataset(BaseDataset):
             sample["obs"]["rgb_feature"] = self._slice_with_pad(
                 traj["rgb_feature"], obs_start, self.n_obs_steps
             )
-        if self.use_rgb:
+        if self.use_rgb and "point_cloud" in traj:
+            sample["obs"]["point_cloud"] = self._slice_with_pad(
+                traj["point_cloud"], obs_start, self.n_obs_steps
+            )
+            if self.semantic_feature_mode == "precomputed":
+                sample["obs"]["dino_feature"] = self._slice_with_pad(
+                    traj["dino_feature"], obs_start, self.n_obs_steps
+                )
+            elif self.semantic_feature_mode == "online_dinov3":
+                raise ValueError("Synthetic online_dinov3 samples require raw rgb/source indices")
+            else:
+                raise ValueError(f"Unsupported semantic_feature_mode={self.semantic_feature_mode!r}")
+        elif self.use_rgb:
             sample["obs"]["point_cloud"] = self._load_h5_window(
                 traj["traj_name"], self.pointcloud_path, obs_start, self.n_obs_steps
             )

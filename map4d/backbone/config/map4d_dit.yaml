@@ -30,10 +30,10 @@ policy:
   keyframe_horizon: ${horizon_keyframe}
   n_action_steps: ${n_action_steps}
   n_obs_steps: ${n_obs_steps}
-  trajectory_loss_weight: 1.0
+  trajectory_loss_weight: 30.0
   keyframe_tcp_loss_weight: 1.0
   keyframe_map4d_loss_weight: 0.3
-  gripper_loss_weight: 1.0
+  gripper_loss_weight: 30.0
   noise_scheduler_cfg:
     num_train_timesteps: 1000
     prediction_type: epsilon
@@ -46,16 +46,11 @@ policy:
     map4d_dim: ${map4d_dim}
     size_parameter_dim: ${size_parameter_dim}
     relation_parameter_dim: ${relation_parameter_dim}
+    trajectory_dim: ${task.trajectory_dim}
     tcp_dim: ${task.keyframe_tcp_dim}
     rgb_feature_dim: 288
     semantic_feature_dim: 288
     semantic_feature_mode: precomputed
-    dinov3_model: dinov3_vits16
-    dinov3_weights_path: /data2/zehao/models/DINOv3/DINOv3_ViT_LVD_1689M/dinov3_vits16_pretrain_lvd1689m-08c60483.pth
-    dinov3_third_party_dir: /data2/zehao/MAP4D/4dmap_v1/map4d/backbone/model/vision/dinov3
-    dinov3_image_size: 224
-    dinov3_input_multiple: 16
-    dinov3_amp: true
     map_feature_dim: 240
     n_map_step: ${n_obs_steps}
     num_map_nodes: ${num_map_nodes}
@@ -63,6 +58,13 @@ policy:
     map_name: ${task.name}
     map_encoder_num_layers: 4
     map_encoder_num_heads: 8
+    use_lang: false
+    pointcloud_encoder_cfg:
+      in_channels: 291
+      out_channels: ${policy.model_cfg.embed_dim}
+      use_bn: true
+      npoint1: 1024
+      npoint2: 512
     embed_dim: 240
     depth: 8
     num_heads: 8
@@ -108,21 +110,22 @@ training:
   resume: false
   lr_scheduler: cosine
   lr_warmup_steps: 500
-  num_epochs: 10000
+  num_epochs: 1000
   gradient_accumulate_every: 1
   use_ema: true
   checkpoint_every: 50
   val_every: 50
   sample_every: 20
-  eval_env_every: 1000
+  eval_env_every: 0
   num_eval_episodes: 100
   num_eval_envs: 10
   max_train_steps: null
   max_val_steps: null
+  ddp_find_unused_parameters: true
   tqdm_interval_sec: 0.01
 
 rollout:
-  enabled: true
+  enabled: false
   every: 100
   num_eval_episodes: 100
   num_eval_envs: 10
@@ -130,13 +133,16 @@ rollout:
   metrics_dir: outputs/eval_metrics
   run_name: ${alg_name}_${addition_info}_seed${seed}
   sim_backend: physx_cuda
-  obs_mode: rgb
+  obs_mode: rgb+depth
   control_mode: ${task.eval_control_mode}
   max_episode_steps: ${task.eval_max_episode_steps}
   action_mode: ${task.eval_action_mode}
   use_rgb: ${policy.model_cfg.use_rgb}
   camera_names: [base_camera, hand_camera]
   image_size: 224
+  pointcloud_num_points: 6144
+  pointcloud_bbox: auto
+  pointcloud_seed: 0
   dinov3_model: dinov3_vits16
   dinov3_weights_path: /data2/zehao/models/DINOv3/DINOv3_ViT_LVD_1689M/dinov3_vits16_pretrain_lvd1689m-08c60483.pth
   dinov3_third_party_dir: /data2/zehao/MAP4D/4dmap_v1/map4d/backbone/model/vision/dinov3
@@ -161,7 +167,7 @@ checkpoint:
   topk:
     monitor_key: val_loss
     mode: min
-    k: 1
+    k: 5
     format_str: epoch={epoch:04d}-val_loss={val_loss:.7f}.pth.tar
   save_last_ckpt: true
   save_last_snapshot: false

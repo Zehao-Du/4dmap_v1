@@ -33,10 +33,11 @@ from helper.build_keyframe_aux_dataset import (
     _infer_task_name,
     _parse_actor_names,
 )
-from map4d.representation.maps4d.metadata import get_task_num_map_nodes
+from map4d.representation.maps4d.metadata import TASK_METADATA_FILES, get_task_num_map_nodes
 
 
 GT_MAP_FORMAT = "map4d_gt_pose_sidecar_v1"
+SEMANTIC_FIELD_FORMAT = "rgbd_points_plus_map4d_node_centers_v1"
 
 
 def _traj_sort_key(name: str) -> int:
@@ -62,6 +63,13 @@ def _read_sidecar_map(sidecar: Optional[h5py.File], traj_name: str) -> Optional[
     return np.asarray(group["map4d"][()], dtype=np.float32)
 
 
+def _representation_json_path(task_name: str) -> str:
+    filename = TASK_METADATA_FILES.get(task_name)
+    if filename is None:
+        raise KeyError(f"No Map4D representation JSON registered for task {task_name!r}")
+    return f"map4d/representation/maps4d/{filename}"
+
+
 def _validate_no_precomputed_map_features(sidecar: h5py.File) -> None:
     stale_paths = []
     for traj_name in sidecar.keys():
@@ -85,10 +93,12 @@ def _load_pose_map4d(
     sidecar_map = _read_sidecar_map(sidecar, traj_name)
     if sidecar_map is None:
         raise KeyError(f"Input sidecar missing {traj_name}/map4d")
-    if sidecar_map.ndim != 3 or sidecar_map.shape[-1] not in {9, 12}:
-        raise ValueError(f"{traj_name}: expected sidecar map4d [T,N,9/12], got {sidecar_map.shape}")
-    if sidecar_map.shape[-1] == 9:
+    if sidecar_map.ndim != 3 or sidecar_map.shape[-1] not in {7, 9, 10, 12}:
+        raise ValueError(f"{traj_name}: expected sidecar map4d [T,N,7/9/10/12], got {sidecar_map.shape}")
+    if sidecar_map.shape[-1] in {7, 9}:
         return sidecar_map.astype(np.float32)
+    if sidecar_map.shape[-1] == 10:
+        return sidecar_map[..., 3:10].astype(np.float32)
     return sidecar_map[..., 3:12].astype(np.float32)
 
 
@@ -97,6 +107,7 @@ def _validate_semantic_field(
     *,
     pointcloud_path: str,
     dino_feature_path: str,
+    map4d: np.ndarray,
 ) -> Dict[str, object]:
     point_node = traj
     for part in pointcloud_path.split("/"):
@@ -126,10 +137,67 @@ def _validate_semantic_field(
         raise ValueError(
             f"{traj.name}: point_cloud and dino_feature must share [T,P], got {point_shape} and {dino_shape}"
         )
+    if map4d.ndim != 3 or map4d.shape[-1] < 3:
+        raise ValueError(f"{traj.name}: map4d must be [T,N,>=3], got {map4d.shape}")
+    node_count = int(map4d.shape[1])
+    if point_shape[0] != map4d.shape[0]:
+        raise ValueError(f"{traj.name}: semantic field T={point_shape[0]} != map4d T={map4d.shape[0]}")
+    if point_shape[1] <= node_count:
+        raise ValueError(f"{traj.name}: semantic field point count {point_shape[1]} must exceed N={node_count}")
+    source_group = traj.get("obs", {}).get("semantic_field_source") if "obs" in traj else None
+    if not isinstance(source_group, h5py.Group):
+        raise KeyError(f"{traj.name} missing obs/semantic_field_source")
+    if "token_type" not in source_group:
+        raise KeyError(f"{traj.name} missing obs/semantic_field_source/token_type")
+    token_type = np.asarray(source_group["token_type"][()])
+    if token_type.shape != point_shape[:2]:
+        raise ValueError(
+            f"{traj.name}: token_type shape {token_type.shape} must match semantic field [T,P+N] {point_shape[:2]}"
+        )
+    if not np.all(token_type[:, -node_count:] == 1):
+        raise ValueError(f"{traj.name}: last {node_count} token_type entries must be Map4D node centers")
+    if not np.all(token_type[:, : -node_count] == 0):
+        raise ValueError(f"{traj.name}: RGB-D token_type prefix must be 0")
+    if "node_center_token_indices" not in source_group:
+        raise KeyError(f"{traj.name} missing obs/semantic_field_source/node_center_token_indices")
+    expected_indices = np.arange(point_shape[1] - node_count, point_shape[1], dtype=np.int32)
+    actual_indices = np.asarray(source_group["node_center_token_indices"][()], dtype=np.int32).reshape(-1)
+    if not np.array_equal(actual_indices, expected_indices):
+        raise ValueError(
+            f"{traj.name}: node_center_token_indices must be {expected_indices.tolist()}, "
+            f"got {actual_indices.tolist()}"
+        )
+    point_xyz_tail = np.asarray(point_node[:, -node_count:, :3], dtype=np.float32)
+    if not np.allclose(point_xyz_tail, map4d[..., 0:3], atol=1e-5):
+        raise ValueError(f"{traj.name}: last {node_count} point_cloud xyz rows must match map4d positions")
     _require_dino_provenance(traj.name, dino_node)
     return {
         "point_cloud_shape": point_shape,
         "dino_feature_shape": dino_shape,
+        "rgbd_point_count": int(point_shape[1] - node_count),
+        "node_center_count": node_count,
+        "semantic_field_format": SEMANTIC_FIELD_FORMAT,
+    }
+
+
+def _validate_pointcloud_field(
+    traj: h5py.Group,
+    *,
+    pointcloud_path: str,
+) -> Dict[str, object]:
+    point_node = traj
+    for part in pointcloud_path.split("/"):
+        if not isinstance(point_node, h5py.Group) or part not in point_node:
+            raise KeyError(f"{traj.name} missing {pointcloud_path}")
+        point_node = point_node[part]
+    if not isinstance(point_node, h5py.Dataset):
+        raise TypeError(f"{traj.name}/{pointcloud_path} must be an HDF5 dataset")
+
+    point_shape = tuple(point_node.shape)
+    if len(point_shape) != 3 or point_shape[-1] < 3:
+        raise ValueError(f"{traj.name}/{pointcloud_path} must be [T,P,>=3], got {point_shape}")
+    return {
+        "point_cloud_shape": point_shape,
     }
 
 
@@ -175,8 +243,11 @@ def build_map4d_context_dataset(
     num_traj: Optional[int],
     pointcloud_path: str,
     dino_feature_path: str,
+    require_semantic_field: bool,
     overwrite: bool,
 ) -> Dict[str, object]:
+    if not require_semantic_field:
+        raise ValueError("--skip-semantic-field-validation is disabled; unified Semantic Field validation is required.")
     if output_path.exists() and not overwrite:
         raise FileExistsError(f"{output_path} exists. Pass --overwrite to replace it.")
     if input_sidecar_path is None:
@@ -200,20 +271,30 @@ def build_map4d_context_dataset(
                 if input_sidecar_path is not None:
                     f_out.attrs["source_sidecar_path"] = str(input_sidecar_path)
                 f_out.attrs["task_name"] = task_name
-                f_out.attrs["actor_names"] = json.dumps(list(actor_names))
+                f_out.attrs["representation_json"] = sidecar_in.attrs.get(
+                    "representation_json",
+                    _representation_json_path(task_name),
+                )
                 f_out.attrs["map_context_format"] = GT_MAP_FORMAT
                 f_out.attrs["num_map_nodes"] = int(num_map_nodes)
                 f_out.attrs["map_encoder_location"] = "online_in_Map4DDiT"
+                f_out.attrs["semantic_field_format"] = SEMANTIC_FIELD_FORMAT
 
                 for traj_name in traj_names:
                     traj = f_demo[traj_name]
-                    semantic_info = _validate_semantic_field(
-                        traj,
-                        pointcloud_path=pointcloud_path,
-                        dino_feature_path=dino_feature_path,
-                    )
-
                     pose_map4d = _load_pose_map4d(sidecar_in, traj_name)
+                    if require_semantic_field:
+                        semantic_info = _validate_semantic_field(
+                            traj,
+                            pointcloud_path=pointcloud_path,
+                            dino_feature_path=dino_feature_path,
+                            map4d=pose_map4d,
+                        )
+                    else:
+                        semantic_info = _validate_pointcloud_field(
+                            traj,
+                            pointcloud_path=pointcloud_path,
+                        )
 
                     group = f_out.require_group(traj_name)
                     group.attrs["num_frames"] = int(pose_map4d.shape[0])
@@ -230,7 +311,8 @@ def build_map4d_context_dataset(
                         "num_map_nodes": int(num_map_nodes),
                     }
                     if semantic_info is not None:
-                        row.update({key: list(value) for key, value in semantic_info.items()})
+                        for key, value in semantic_info.items():
+                            row[key] = list(value) if isinstance(value, tuple) else value
                     summary_rows.append(row)
         finally:
             sidecar_in.close()
@@ -244,10 +326,11 @@ def build_map4d_context_dataset(
         "output_path": str(output_path),
         "task_name": task_name,
         "actor_names": list(actor_names),
+        "representation_json": _representation_json_path(task_name),
         "map_context_format": GT_MAP_FORMAT,
         "num_map_nodes": int(num_map_nodes),
         "num_trajectories": len(summary_rows),
-        "require_semantic_field": True,
+        "require_semantic_field": bool(require_semantic_field),
         "pointcloud_path": pointcloud_path,
         "dino_feature_path": dino_feature_path,
         "trajectories": summary_rows,
@@ -270,6 +353,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-traj", type=int, default=None)
     parser.add_argument("--pointcloud-path", default="obs/point_cloud/fused")
     parser.add_argument("--dino-feature-path", default="obs/dino_feature")
+    parser.add_argument(
+        "--skip-semantic-field-validation",
+        action="store_true",
+        help="Only validate point clouds. Use for online_dinov3 training datasets without precomputed obs/dino_feature.",
+    )
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
 
@@ -287,6 +375,7 @@ def main() -> None:
         num_traj=args.num_traj,
         pointcloud_path=args.pointcloud_path,
         dino_feature_path=args.dino_feature_path,
+        require_semantic_field=not args.skip_semantic_field_validation,
         overwrite=args.overwrite,
     )
 

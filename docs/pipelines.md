@@ -6,8 +6,8 @@
 
 当前主要使用 ManiSkill demonstration HDF5 数据。StackCube 使用 `StackCube-v1`、`pd_ee_delta_pos`、最多 1000 step；PlugCharger 使用 `PlugCharger-v1`、`pd_ee_delta_pose`、最多 400 step。数据采集脚本位于：
 
-- `scripts/data_collection/collect_stackcube.sh`
-- `scripts/data_collection/collect_plugcharger.sh`
+- `scripts/data_collection/dp_dataset/collect_stackcube.sh`
+- `scripts/data_collection/dp_dataset/collect_plugcharger.sh`
 
 训练时 policy 读取 RGB、可选 depth、robot state 和 action。启用 `--use-map4d` 后，会额外读取或构造 `map4d` 序列。当前主路径是 `--map4d-source maniskill_gt`，直接从 HDF5 的 `env_states/actors` 读取物体 GT pose，并拼成每帧张量：
 

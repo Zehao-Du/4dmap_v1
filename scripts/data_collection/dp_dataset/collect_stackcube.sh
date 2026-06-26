@@ -1,15 +1,15 @@
 #!/bin/bash
-# Collect PlugCharger-v1 demos via motion planning + replay to pd_ee_delta_pose
+# Collect StackCube-v1 demos via motion planning + replay to pd_ee_delta_pos
 # Only keeps trajectories <= 400 steps (filters out long retry trajectories)
 # Reference: 4dmap_policy/README.md
 set -e
 ROOT_DIR="${ROOT_DIR:-/inspire/hdd/project/robot-dna/baojiachun-CZXS25130063/zehao/4dmap}"
-DATASET_DIR="${DATASET_DIR:-$ROOT_DIR/dataset/ManiSkill/PlugCharger-v1/motionplanning}"
+DATASET_DIR="${DATASET_DIR:-$ROOT_DIR/dataset/ManiSkill/StackCube-v1/motionplanning}"
 RECORD_DIR="${RECORD_DIR:-$ROOT_DIR/dataset/ManiSkill}"
 POLICY_DIR="${POLICY_DIR:-$ROOT_DIR/4dmap_policy}"
 
 echo "Cleaning old data in $DATASET_DIR ..."
-rm -f "$DATASET_DIR"/PlugCharger*.h5 "$DATASET_DIR"/PlugCharger*.json
+rm -f "$DATASET_DIR"/StackCube*.h5 "$DATASET_DIR"/StackCube*.json
 mkdir -p "$DATASET_DIR"
 
 TARGET_DEMOS=${1:-1000}
@@ -17,6 +17,7 @@ MAX_STEPS=400
 NUM_PROCS=${2:-10}
 IMAGE_SIZE=${3:-224}
 OBS_MODE="${OBS_MODE:-rgb+depth}"
+REPLAY_NUM_ENVS="${REPLAY_NUM_ENVS:-$NUM_PROCS}"
 # Collect extra to account for filtering (empirically ~65% pass the filter)
 COLLECT_N=$(( TARGET_DEMOS * 2 ))
 PATCH_CAMERA_CONFIG=0
@@ -34,20 +35,21 @@ if [[ -n "$IMAGE_SIZE" && "$IMAGE_SIZE" != "native" ]]; then
   PATCH_CAMERA_CONFIG=1
 fi
 
-echo "[$(date +%H:%M:%S)] Step 1: Collecting $COLLECT_N PlugCharger-v1 trajectories (targeting $TARGET_DEMOS after filtering)..."
+echo "[$(date +%H:%M:%S)] Step 1: Collecting $COLLECT_N StackCube-v1 trajectories (targeting $TARGET_DEMOS after filtering)..."
 python -m mani_skill.examples.motionplanning.panda.run \
-  -e PlugCharger-v1 \
+  -e StackCube-v1 \
   -n "$COLLECT_N" \
   --only-count-success \
   -b cpu \
-  --traj-name PlugCharger \
+  --traj-name StackCube \
   --record-dir "$RECORD_DIR" \
-  --num-procs "$NUM_PROCS"
+  --num-procs "$NUM_PROCS" \
+  --image-size "$IMAGE_SIZE"
 
 if [[ "$PATCH_CAMERA_CONFIG" == "1" ]]; then
   python -c "
 import json
-path = '$DATASET_DIR/PlugCharger.json'
+path = '$DATASET_DIR/StackCube.json'
 with open(path, 'r') as f:
     data = json.load(f)
 env_kwargs = data.setdefault('env_info', {}).setdefault('env_kwargs', {})
@@ -59,23 +61,25 @@ with open(path, 'w') as f:
 "
 fi
 
-echo "[$(date +%H:%M:%S)] Step 2: Replaying to ${OBS_MODE} + pd_ee_delta_pose..."
+echo "[$(date +%H:%M:%S)] Step 2: Replaying to ${OBS_MODE} + pd_ee_delta_pos..."
+echo "  replay_num_envs: $REPLAY_NUM_ENVS"
 python -m mani_skill.trajectory.replay_trajectory \
-  --traj-path "$DATASET_DIR/PlugCharger.h5" \
+  --traj-path "$DATASET_DIR/StackCube.h5" \
   -o "$OBS_MODE" \
-  -c pd_ee_delta_pose \
+  -c pd_ee_delta_pos \
+  --image-size "$IMAGE_SIZE" \
   --no-verbose \
   --max-retry 3 \
   --no-allow-failure \
   --save-traj \
-  -n 1
+  -n "$REPLAY_NUM_ENVS"
 
 echo "[$(date +%H:%M:%S)] Step 3: Filtering trajectories > $MAX_STEPS steps..."
 python -c "
 import h5py, json, os, sys
 
-src = '$DATASET_DIR/PlugCharger.$OBS_MODE.pd_ee_delta_pose.physx_cpu.h5'
-dst = '$DATASET_DIR/PlugCharger.$OBS_MODE.pd_ee_delta_pose.physx_cpu.filtered.h5'
+src = '$DATASET_DIR/StackCube.$OBS_MODE.pd_ee_delta_pos.physx_cpu.h5'
+dst = '$DATASET_DIR/StackCube.$OBS_MODE.pd_ee_delta_pos.physx_cpu.filtered.h5'
 max_steps = $MAX_STEPS
 target = $TARGET_DEMOS
 
@@ -105,5 +109,5 @@ if os.path.exists(json_src):
 "
 
 echo "[$(date +%H:%M:%S)] Done."
-echo "Filtered dataset: $DATASET_DIR/PlugCharger.$OBS_MODE.pd_ee_delta_pose.physx_cpu.filtered.h5"
-ls -la "$DATASET_DIR"/PlugCharger*.filtered.*
+echo "Filtered dataset: $DATASET_DIR/StackCube.$OBS_MODE.pd_ee_delta_pos.physx_cpu.filtered.h5"
+ls -la "$DATASET_DIR"/StackCube*.filtered.*

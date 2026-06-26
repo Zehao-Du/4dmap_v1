@@ -1,5 +1,6 @@
 # dataset
 data/
+/dataset/
 outputs/
 runs/
 
@@ -26,9 +27,6 @@ checkpoints/
 *.pth
 *.ckpt
 *.safetensors
-
-# third party vendored models
-third_party/
 
 # core dumps
 core.*

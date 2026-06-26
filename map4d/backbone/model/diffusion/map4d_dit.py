@@ -10,13 +10,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from map4d.backbone.model.diffusion.conditional_dit1d import _modulate
 from map4d.backbone.model.diffusion.diffuser_actor_utils.layers import (
     FFWRelativeCrossAttentionModule,
     FFWRelativeSelfAttentionModule,
 )
 from map4d.backbone.model.diffusion.diffuser_actor_utils.position_encodings import RotaryPositionEncoding3D
 from map4d.backbone.model.diffusion.positional_embedding import SinusoidalPosEmb
+from map4d.backbone.model.vision.observation_encoder import ObservationEncoder
 from map4d.encoder.map_encoder import Map4DEncoder
 
 MAPS4D_DIR = Path(__file__).resolve().parents[3] / "representation" / "maps4d"
@@ -48,6 +48,27 @@ def matrix_to_rot6d(matrix: torch.Tensor) -> torch.Tensor:
     return torch.cat((matrix[..., :, 0], matrix[..., :, 1]), dim=-1)
 
 
+def quat_to_matrix(quat: torch.Tensor) -> torch.Tensor:
+    """Convert canonical WXYZ quaternions to rotation matrices."""
+    quat = normalize_quaternion(quat)
+    w, x, y, z = quat.unbind(dim=-1)
+    matrix = torch.empty((*quat.shape[:-1], 3, 3), dtype=quat.dtype, device=quat.device)
+    matrix[..., 0, 0] = 1.0 - 2.0 * (y * y + z * z)
+    matrix[..., 0, 1] = 2.0 * (x * y - z * w)
+    matrix[..., 0, 2] = 2.0 * (x * z + y * w)
+    matrix[..., 1, 0] = 2.0 * (x * y + z * w)
+    matrix[..., 1, 1] = 1.0 - 2.0 * (x * x + z * z)
+    matrix[..., 1, 2] = 2.0 * (y * z - x * w)
+    matrix[..., 2, 0] = 2.0 * (x * z - y * w)
+    matrix[..., 2, 1] = 2.0 * (y * z + x * w)
+    matrix[..., 2, 2] = 1.0 - 2.0 * (x * x + y * y)
+    return matrix
+
+
+def quat_to_rot6d(quat: torch.Tensor) -> torch.Tensor:
+    return matrix_to_rot6d(quat_to_matrix(quat))
+
+
 class Map4DDiT(nn.Module):
     """PPI-style staged denoiser for Map4D policy.
 
@@ -60,9 +81,8 @@ class Map4DDiT(nn.Module):
     context field for cross-attention.
     """
 
-    trajectory_dim = 7
-    node_dim = 9
-    object_dim = 9
+    node_dim = 7
+    object_dim = 7
 
     def __init__(
         self,
@@ -72,10 +92,11 @@ class Map4DDiT(nn.Module):
         action_horizon: int,
         keyframe_horizon: int,
         obs_horizon: int = 2,
-        map4d_dim: int = 9,
+        map4d_dim: int = 7,
         size_parameter_dim: int = 0,
         rgb_feature_dim: int = 0,
         relation_parameter_dim: int = 0,
+        trajectory_dim: int = 7,
         tcp_dim: int = 7,
         embed_dim: int = 240,
         depth: int = 6,
@@ -87,12 +108,6 @@ class Map4DDiT(nn.Module):
         max_context_tokens: int = 1024,
         semantic_feature_dim: Optional[int] = None,
         semantic_feature_mode: str = "precomputed",
-        dinov3_model: str = "dinov3_vits16",
-        dinov3_weights_path: Optional[str] = None,
-        dinov3_third_party_dir: Optional[str] = None,
-        dinov3_image_size: int = 224,
-        dinov3_input_multiple: int = 16,
-        dinov3_amp: bool = True,
         point_dim: int = 3,
         map_feature_dim: int = 240,
         n_map_step: Optional[int] = None,
@@ -103,6 +118,9 @@ class Map4DDiT(nn.Module):
         map_encoder_hidden_dim: Optional[int] = None,
         map_encoder_num_layers: int = 4,
         map_encoder_num_heads: int = 8,
+        pointcloud_encoder_cfg: Optional[Dict] = None,
+        observation_encoder_cfg: Optional[Dict] = None,
+        use_lang: bool = False,
         detach_stage_features: bool = True,
         cross_attn_layers: int = 2,
         self_attn_layers: Optional[int] = None,
@@ -121,26 +139,24 @@ class Map4DDiT(nn.Module):
         self.keyframe_horizon = int(keyframe_horizon)
         self.obs_horizon = int(obs_horizon)
         self.map4d_dim = int(map4d_dim)
+        self.node_dim = self.map4d_dim
+        self.object_dim = self.map4d_dim
         self.size_parameter_dim = int(size_parameter_dim)
         self.relation_parameter_dim = int(relation_parameter_dim)
+        self.trajectory_dim = int(trajectory_dim)
         self.tcp_dim = int(tcp_dim)
+        if self.trajectory_dim not in {4, 7}:
+            raise ValueError(f"Map4DDiT supports trajectory_dim 4 or 7, got {self.trajectory_dim}")
         self.embed_dim = int(embed_dim)
         self.max_context_tokens = int(max_context_tokens)
         self.point_dim = int(point_dim)
         self.semantic_feature_dim = int(semantic_feature_dim or rgb_feature_dim or 384)
         self.semantic_feature_mode = str(semantic_feature_mode)
-        if self.semantic_feature_mode not in {"precomputed", "online_dinov3"}:
+        if self.semantic_feature_mode != "precomputed":
             raise ValueError(
-                "semantic_feature_mode must be 'precomputed' or 'online_dinov3', "
+                "Map4DDiT expects precomputed obs.dino_feature from ObservationEncoder input, "
                 f"got {self.semantic_feature_mode!r}"
             )
-        self.dinov3_model = str(dinov3_model)
-        self.dinov3_weights_path = "" if dinov3_weights_path is None else str(dinov3_weights_path)
-        self.dinov3_third_party_dir = "" if dinov3_third_party_dir is None else str(dinov3_third_party_dir)
-        self.dinov3_image_size = None if dinov3_image_size is None else int(dinov3_image_size)
-        self.dinov3_input_multiple = int(dinov3_input_multiple)
-        self.dinov3_amp = bool(dinov3_amp)
-        object.__setattr__(self, "_dinov3_backbone", None)
         self.map_feature_dim = int(map_feature_dim)
         self.n_map_step = int(n_map_step or obs_horizon)
         self.num_arms = int(num_arms)
@@ -156,43 +172,39 @@ class Map4DDiT(nn.Module):
             raise ValueError("num_arms must be positive")
         if self.n_map_step <= 0:
             raise ValueError("n_map_step must be positive")
-        if self.semantic_feature_mode == "online_dinov3":
-            if not self.dinov3_weights_path:
-                raise ValueError("online_dinov3 requires dinov3_weights_path")
-            if not Path(self.dinov3_weights_path).expanduser().exists():
-                raise FileNotFoundError(f"DINOv3 weights not found: {self.dinov3_weights_path}")
-            if not self.dinov3_third_party_dir:
-                raise ValueError("online_dinov3 requires dinov3_third_party_dir")
-            if not Path(self.dinov3_third_party_dir).expanduser().exists():
-                raise FileNotFoundError(f"DINOv3 third_party dir not found: {self.dinov3_third_party_dir}")
-            if self.dinov3_image_size is not None and self.dinov3_image_size <= 0:
-                raise ValueError("dinov3_image_size must be positive or null")
-            if self.dinov3_input_multiple <= 0:
-                raise ValueError("dinov3_input_multiple must be positive")
-            self.register_buffer(
-                "_dinov3_mean",
-                torch.tensor((0.485, 0.456, 0.406), dtype=torch.float32).view(1, 3, 1, 1),
-                persistent=False,
-            )
-            self.register_buffer(
-                "_dinov3_std",
-                torch.tensor((0.229, 0.224, 0.225), dtype=torch.float32).view(1, 3, 1, 1),
-                persistent=False,
-            )
-
         self.trajectory_proj = nn.Linear(self.trajectory_dim, embed_dim)
-        self.node_proj = nn.Linear(self.node_dim, embed_dim)
+        self.node_proj = nn.Linear(self.point_dim, embed_dim)
         self.object_proj = self.node_proj
         self.tcp_proj = nn.Linear(self.tcp_dim, embed_dim)
-        self.semantic_field_proj = nn.Sequential(
-            nn.Linear(self.point_dim + self.semantic_feature_dim, embed_dim),
-            nn.SiLU(),
-            nn.Linear(embed_dim, embed_dim),
+        if pointcloud_encoder_cfg is None:
+            pointcloud_encoder_cfg = {
+                "in_channels": self.point_dim + self.semantic_feature_dim,
+                "out_channels": embed_dim,
+                "use_bn": True,
+                "npoint1": 1024,
+                "npoint2": 512,
+            }
+        observation_encoder_cfg = dict(observation_encoder_cfg or {})
+        self.obs_encoder = ObservationEncoder(
+            state_shape=self.robot_state_dim,
+            out_channel=embed_dim,
+            dim_dino_feature=self.semantic_feature_dim,
+            state_mlp_size=tuple(observation_encoder_cfg.pop("state_mlp_size", (embed_dim, embed_dim))),
+            lang_mlp_size=tuple(observation_encoder_cfg.pop("lang_mlp_size", (embed_dim, embed_dim))),
+            pcd_mlp_size=tuple(observation_encoder_cfg.pop("pcd_mlp_size", (embed_dim, embed_dim))),
+            pointcloud_encoder_cfg=pointcloud_encoder_cfg,
+            use_lang=use_lang,
+            state_key="robot_state",
+            point_cloud_key="point_cloud",
+            lang_key="lang",
+            **observation_encoder_cfg,
         )
         self.map_feature_proj = nn.Sequential(
+            nn.LayerNorm(self.map_feature_dim),
             nn.Linear(self.map_feature_dim, embed_dim),
             nn.SiLU(),
             nn.Linear(embed_dim, embed_dim),
+            nn.LayerNorm(embed_dim),
         )
 
         self.map_encoder = None
@@ -207,11 +219,7 @@ class Map4DDiT(nn.Module):
             if int(map_encoder_hidden_dim or self.map_feature_dim) != self.map_feature_dim:
                 raise ValueError("map_encoder_hidden_dim must equal map_feature_dim")
 
-        self.robot_encoder = nn.Sequential(
-            nn.Linear(robot_state_dim * obs_horizon, embed_dim),
-            nn.SiLU(),
-            nn.Linear(embed_dim, embed_dim),
-        )
+        self.robot_encoder = None
         self.time_encoder = nn.Sequential(
             SinusoidalPosEmb(diffusion_step_embed_dim),
             nn.Linear(diffusion_step_embed_dim, embed_dim),
@@ -262,10 +270,10 @@ class Map4DDiT(nn.Module):
         self.final_norm = nn.LayerNorm(embed_dim, elementwise_affine=False, eps=1e-6)
         self.final_modulation = nn.Sequential(nn.SiLU(), nn.Linear(embed_dim, 2 * embed_dim))
         self.trajectory_head = nn.Linear(embed_dim, self.trajectory_dim)
-        self.node_head = nn.Linear(embed_dim, self.node_dim)
+        self.node_head = nn.Linear(embed_dim, self.point_dim)
         self.object_head = self.node_head
         self.tcp_head = nn.Linear(embed_dim, self.tcp_dim)
-        self.gripper_head = nn.Linear(embed_dim, 1)
+        self.gripper_head = None if self.trajectory_dim == 4 else nn.Linear(embed_dim, 1)
 
         for param in (
             self.trajectory_pos_embed,
@@ -283,147 +291,6 @@ class Map4DDiT(nn.Module):
         nn.init.zeros_(self.final_modulation[-1].weight)
         nn.init.zeros_(self.final_modulation[-1].bias)
 
-    def _load_online_dinov3_backbone(self, device: torch.device):
-        backbone = object.__getattribute__(self, "_dinov3_backbone")
-        if backbone is None:
-            project_root = Path(__file__).resolve().parents[4]
-            dp_root = project_root / "baselines" / "diffusion_policy"
-            if str(dp_root) not in sys.path:
-                sys.path.insert(0, str(dp_root))
-            from diffusion_policy.dinov3_encoder import _load_backbone  # noqa: PLC0415
-
-            backbone = _load_backbone(
-                self.dinov3_third_party_dir,
-                self.dinov3_weights_path,
-                self.dinov3_model,
-            )
-            backbone.eval()
-            for parameter in backbone.parameters():
-                parameter.requires_grad_(False)
-            embed_dim = int(getattr(backbone, "embed_dim", 0))
-            if embed_dim != self.semantic_feature_dim:
-                raise ValueError(
-                    f"DINOv3 embed_dim={embed_dim} does not match "
-                    f"semantic_feature_dim={self.semantic_feature_dim}"
-                )
-            object.__setattr__(self, "_dinov3_backbone", backbone)
-        backbone.to(device)
-        backbone.eval()
-        return backbone
-
-    @staticmethod
-    def _dinov3_patch_size(backbone) -> Tuple[int, int]:
-        patch_size = getattr(backbone, "patch_size", None)
-        if patch_size is None and hasattr(backbone, "patch_embed"):
-            patch_size = getattr(backbone.patch_embed, "patch_size", None)
-        if patch_size is None:
-            raise AttributeError("DINOv3 backbone does not expose patch_size or patch_embed.patch_size")
-        if isinstance(patch_size, int):
-            return int(patch_size), int(patch_size)
-        if isinstance(patch_size, (tuple, list)) and len(patch_size) == 2:
-            return int(patch_size[0]), int(patch_size[1])
-        raise TypeError(f"Unsupported DINOv3 patch_size={patch_size!r}")
-
-    def _online_dinov3_point_features(
-        self,
-        obs: Dict[str, torch.Tensor],
-        point_cloud: torch.Tensor,
-    ) -> torch.Tensor:
-        rgb = obs.get("rgb")
-        camera_index = obs.get("point_camera_index")
-        pixel_uv = obs.get("point_pixel_uv")
-        if rgb is None or camera_index is None or pixel_uv is None:
-            raise ValueError(
-                "online_dinov3 requires obs.rgb, obs.point_camera_index, and obs.point_pixel_uv"
-            )
-        if rgb.ndim != 6 or rgb.shape[-1] != 3:
-            raise ValueError(f"obs.rgb must have shape [B,T,C,H,W,3], got {rgb.shape}")
-        if camera_index.ndim != 3:
-            raise ValueError(f"obs.point_camera_index must have shape [B,T,P], got {camera_index.shape}")
-        if pixel_uv.ndim != 4 or pixel_uv.shape[-1] != 2:
-            raise ValueError(f"obs.point_pixel_uv must have shape [B,T,P,2], got {pixel_uv.shape}")
-        batch_size, steps, point_count = point_cloud.shape[:3]
-        if rgb.shape[:2] != (batch_size, steps):
-            raise ValueError(f"obs.rgb [B,T] {rgb.shape[:2]} must match point_cloud {(batch_size, steps)}")
-        if camera_index.shape != (batch_size, steps, point_count):
-            raise ValueError(
-                f"obs.point_camera_index shape {camera_index.shape} must match [B,T,P] "
-                f"{(batch_size, steps, point_count)}"
-            )
-        if pixel_uv.shape[:3] != (batch_size, steps, point_count):
-            raise ValueError(
-                f"obs.point_pixel_uv shape {pixel_uv.shape} must match [B,T,P,2] "
-                f"{(batch_size, steps, point_count, 2)}"
-            )
-
-        device = point_cloud.device
-        dtype = point_cloud.dtype
-        backbone = self._load_online_dinov3_backbone(device)
-        camera_count = int(rgb.shape[2])
-        image_h, image_w = int(rgb.shape[3]), int(rgb.shape[4])
-        target_h, target_w = (
-            (self.dinov3_image_size, self.dinov3_image_size)
-            if self.dinov3_image_size is not None
-            else (image_h, image_w)
-        )
-        if self.dinov3_image_size is None and self.dinov3_input_multiple > 1:
-            target_h = ((target_h + self.dinov3_input_multiple - 1) // self.dinov3_input_multiple) * self.dinov3_input_multiple
-            target_w = ((target_w + self.dinov3_input_multiple - 1) // self.dinov3_input_multiple) * self.dinov3_input_multiple
-        patch_h, patch_w = self._dinov3_patch_size(backbone)
-        if target_h % patch_h != 0 or target_w % patch_w != 0:
-            raise ValueError(
-                f"DINO input size {(target_h, target_w)} must be divisible by patch size {(patch_h, patch_w)}"
-            )
-        grid_h, grid_w = target_h // patch_h, target_w // patch_w
-
-        x = rgb.reshape(batch_size * steps * camera_count, image_h, image_w, 3).float().div_(255.0)
-        x = x.permute(0, 3, 1, 2).contiguous()
-        if (target_h, target_w) != (image_h, image_w):
-            x = F.interpolate(x, size=(target_h, target_w), mode="bilinear", align_corners=False)
-        mean = self._dinov3_mean.to(device=device, dtype=x.dtype)
-        std = self._dinov3_std.to(device=device, dtype=x.dtype)
-        x = (x - mean) / std
-
-        use_amp = self.dinov3_amp and device.type == "cuda"
-        with torch.no_grad(), torch.autocast(device_type="cuda", enabled=use_amp):
-            feats = backbone.forward_features(x)
-            patch_tokens = feats["x_norm_patchtokens"]
-        if patch_tokens.ndim != 3:
-            raise ValueError(f"DINO patch tokens must be [B,N,D], got {patch_tokens.shape}")
-        if patch_tokens.shape[1] != grid_h * grid_w:
-            raise ValueError(
-                f"DINO patch token count {patch_tokens.shape[1]} does not match grid {grid_h}x{grid_w}"
-            )
-        if patch_tokens.shape[-1] != self.semantic_feature_dim:
-            raise ValueError(
-                f"DINO feature dim {patch_tokens.shape[-1]} does not match "
-                f"semantic_feature_dim={self.semantic_feature_dim}"
-            )
-
-        camera_index = camera_index.to(device=device).long()
-        pixel_uv = pixel_uv.to(device=device).long()
-        if torch.any(camera_index < 0) or torch.any(camera_index >= camera_count):
-            raise ValueError(f"point_camera_index must be in [0,{camera_count}), got invalid values")
-        u = pixel_uv[..., 0]
-        v = pixel_uv[..., 1]
-        if torch.any(u < 0) or torch.any(u >= image_w) or torch.any(v < 0) or torch.any(v >= image_h):
-            raise ValueError(f"point_pixel_uv contains values outside image size {(image_h, image_w)}")
-
-        patch_x = torch.floor((u.float() + 0.5) * grid_w / image_w).long().clamp_(0, grid_w - 1)
-        patch_y = torch.floor((v.float() + 0.5) * grid_h / image_h).long().clamp_(0, grid_h - 1)
-        patch_index = patch_y * grid_w + patch_x
-        patch_tokens = patch_tokens.reshape(
-            batch_size * steps,
-            camera_count,
-            grid_h * grid_w,
-            self.semantic_feature_dim,
-        )
-        flat_camera = camera_index.reshape(batch_size * steps, point_count)
-        flat_patch = patch_index.reshape(batch_size * steps, point_count)
-        flat_bt = torch.arange(batch_size * steps, device=device)[:, None].expand(-1, point_count)
-        feature = patch_tokens[flat_bt, flat_camera, flat_patch]
-        return feature.reshape(batch_size, steps, point_count, self.semantic_feature_dim).to(dtype=dtype)
-
     def _make_timestep(self, timestep: Union[torch.Tensor, float, int], batch_size: int, device):
         if not torch.is_tensor(timestep):
             timestep = torch.tensor([timestep], dtype=torch.long, device=device)
@@ -433,17 +300,7 @@ class Map4DDiT(nn.Module):
             timestep = timestep.to(device=device)
         return timestep.expand(batch_size).long()
 
-    def _global_condition(self, obs: Dict[str, torch.Tensor]) -> torch.Tensor:
-        robot_state = obs["robot_state"]
-        if robot_state.ndim != 3:
-            raise ValueError(f"obs.robot_state must have shape [B, T, D], got {robot_state.shape}")
-        robot_state = robot_state[:, -self.obs_horizon :]
-        if robot_state.shape[1] < self.obs_horizon:
-            pad = robot_state[:, :1].expand(-1, self.obs_horizon - robot_state.shape[1], -1)
-            robot_state = torch.cat([pad, robot_state], dim=1)
-        return self.robot_encoder(robot_state.reshape(robot_state.shape[0], -1))
-
-    def _semantic_context(self, obs: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _observation_context(self, obs: Dict[str, torch.Tensor]):
         point_cloud = obs.get("point_cloud")
         if point_cloud is None:
             raise ValueError("Map4DDiT requires obs.point_cloud")
@@ -451,18 +308,12 @@ class Map4DDiT(nn.Module):
             point_cloud = point_cloud[:, None]
         if point_cloud.ndim != 4:
             raise ValueError(f"obs.point_cloud must have shape [B, T, P, C], got {point_cloud.shape}")
+        if point_cloud.shape[-1] < self.point_dim:
+            raise ValueError(f"point_cloud last dim must be >= {self.point_dim}, got {point_cloud.shape[-1]}")
 
-        if self.semantic_feature_mode == "precomputed":
-            dino_feature = obs.get("dino_feature")
-            if dino_feature is None:
-                raise ValueError("precomputed semantic_feature_mode requires obs.dino_feature")
-        elif self.semantic_feature_mode == "online_dinov3":
-            if "dino_feature" in obs:
-                raise ValueError("online_dinov3 mode expects raw RGB/source indices, not obs.dino_feature")
-            dino_feature = self._online_dinov3_point_features(obs, point_cloud)
-        else:
-            raise ValueError(f"Unsupported semantic_feature_mode={self.semantic_feature_mode!r}")
-
+        dino_feature = obs.get("dino_feature")
+        if dino_feature is None:
+            raise ValueError("Map4DDiT requires precomputed obs.dino_feature")
         if dino_feature.ndim == 3:
             dino_feature = dino_feature[:, None]
         if dino_feature.ndim != 4:
@@ -478,11 +329,37 @@ class Map4DDiT(nn.Module):
                 f"Expected semantic_feature_dim={self.semantic_feature_dim}, got {dino_feature.shape[-1]}"
             )
 
-        xyz = point_cloud[..., : self.point_dim].reshape(point_cloud.shape[0], -1, self.point_dim)
-        feature = dino_feature.reshape(dino_feature.shape[0], -1, self.semantic_feature_dim)
-        token = self.semantic_field_proj(torch.cat([xyz, feature], dim=-1))
-        token = token + self.source_embed[0]
-        return xyz, token
+        robot_state = obs["robot_state"]
+        if robot_state.ndim != 3:
+            raise ValueError(f"obs.robot_state must have shape [B, T, D], got {robot_state.shape}")
+        if robot_state.shape[:2] != point_cloud.shape[:2]:
+            raise ValueError(
+                f"robot_state and point_cloud must share [B,T], got {robot_state.shape} and {point_cloud.shape}"
+            )
+
+        batch_size, steps, point_count = point_cloud.shape[:3]
+        flat_obs = {
+            "point_cloud": point_cloud[..., : self.point_dim].reshape(batch_size * steps, point_count, self.point_dim),
+            "dino_feature": dino_feature.reshape(batch_size * steps, point_count, self.semantic_feature_dim),
+            "robot_state": robot_state.reshape(batch_size * steps, robot_state.shape[-1]),
+        }
+        if "lang" in obs:
+            lang = obs["lang"]
+            if lang.ndim == 3:
+                flat_obs["lang"] = lang.reshape(batch_size * steps, lang.shape[-1])
+            elif lang.ndim == 2:
+                flat_obs["lang"] = lang[:, None].expand(-1, steps, -1).reshape(batch_size * steps, lang.shape[-1])
+            else:
+                raise ValueError(f"obs.lang must have shape [B,D] or [B,T,D], got {lang.shape}")
+
+        context_coord, context_feat, lang_feat, state_feat, sampled_coord, sampled_feat = self.obs_encoder(flat_obs)
+        context_coord = context_coord.reshape(batch_size, steps * point_count, self.point_dim)
+        context_feat = context_feat.reshape(batch_size, steps * point_count, self.embed_dim) + self.source_embed[0]
+        sampled_coord = sampled_coord.reshape(batch_size, steps * sampled_coord.shape[1], self.point_dim)
+        sampled_feat = sampled_feat.reshape(batch_size, steps * sampled_feat.shape[1], self.embed_dim) + self.source_embed[0]
+        lang_feat = lang_feat.reshape(batch_size, steps, self.embed_dim)
+        state_feat = state_feat.reshape(batch_size, steps, self.embed_dim)
+        return context_coord, context_feat, lang_feat, state_feat, sampled_coord, sampled_feat
 
     def _expand_static_parameter(
         self,
@@ -514,26 +391,38 @@ class Map4DDiT(nn.Module):
         if self.map_name is None:
             raise ValueError("Online GT map encoding requires model_cfg.map_name")
 
-        node_poses = obs.get("node_poses")
-        if node_poses is None:
-            raise ValueError("Map4DDiT requires obs.node_poses for online map encoding")
-        if node_poses.ndim == 3:
-            node_poses = node_poses[:, None]
-        if node_poses.ndim != 4:
-            raise ValueError(f"obs.node_poses must have shape [B,T,N,9], got {node_poses.shape}")
-        if node_poses.shape[1] != self.n_map_step:
-            raise ValueError(f"Expected n_map_step={self.n_map_step}, got obs.node_poses T={node_poses.shape[1]}")
-        if node_poses.shape[2] != self.num_target_nodes:
+        node_position = obs.get("node_position")
+        node_rotation = obs.get("node_rotation")
+        if node_position is None or node_rotation is None:
+            node_poses = obs.get("node_poses")
+            if node_poses is None:
+                raise ValueError("Map4DDiT requires obs.node_position and obs.node_rotation for online map encoding")
+            node_position = node_poses[..., 0:3]
+            node_rotation = node_poses[..., 3:]
+        if node_position.ndim == 3:
+            node_position = node_position[:, None]
+        if node_rotation.ndim == 3:
+            node_rotation = node_rotation[:, None]
+        if node_position.ndim != 4 or node_position.shape[-1] != 3:
+            raise ValueError(f"obs.node_position must have shape [B,T,N,3], got {node_position.shape}")
+        if node_rotation.ndim != 4 or node_rotation.shape[-1] != 4:
+            raise ValueError(f"obs.node_rotation must have shape [B,T,N,4], got {node_rotation.shape}")
+        if node_position.shape[:3] != node_rotation.shape[:3]:
             raise ValueError(
-                f"Expected {self.num_target_nodes} target nodes in obs.node_poses, got {node_poses.shape[2]}"
+                f"obs.node_position and obs.node_rotation must share [B,T,N], "
+                f"got {node_position.shape} and {node_rotation.shape}"
             )
-        if node_poses.shape[-1] != 9:
-            raise ValueError(f"Online map encoder expects node pose dim 9, got {node_poses.shape[-1]}")
+        if node_position.shape[1] != self.n_map_step:
+            raise ValueError(f"Expected n_map_step={self.n_map_step}, got obs.node_position T={node_position.shape[1]}")
+        if node_position.shape[2] != self.num_target_nodes:
+            raise ValueError(
+                f"Expected {self.num_target_nodes} target nodes in obs.node_position, got {node_position.shape[2]}"
+            )
 
-        batch_size, steps = node_poses.shape[:2]
-        flat = node_poses.reshape(batch_size * steps, self.num_target_nodes, 9)
-        positions = flat[..., 0:3].reshape(batch_size * steps, -1)
-        rotations = flat[..., 3:9].reshape(batch_size * steps, -1)
+        batch_size, steps = node_position.shape[:2]
+        positions = node_position.reshape(batch_size * steps, self.num_target_nodes, 3).reshape(batch_size * steps, -1)
+        flat_rotation = node_rotation.reshape(batch_size * steps, self.num_target_nodes, node_rotation.shape[-1])
+        rotations = flat_rotation.reshape(batch_size * steps, -1)
 
         size_parameters = obs.get("size_parameters")
         if size_parameters is None:
@@ -542,14 +431,14 @@ class Map4DDiT(nn.Module):
         if relation_parameters is None:
             raise ValueError("Map4DDiT requires obs.relation_parameters for online map encoding")
         sizes = self._expand_static_parameter(
-            size_parameters.to(device=node_poses.device, dtype=node_poses.dtype),
+            size_parameters.to(device=node_position.device, dtype=node_position.dtype),
             batch_size=batch_size,
             steps=steps,
             dim=self.size_parameter_dim,
             name="size_parameters",
         )
         relations = self._expand_static_parameter(
-            relation_parameters.to(device=node_poses.device, dtype=node_poses.dtype),
+            relation_parameters.to(device=node_position.device, dtype=node_position.dtype),
             batch_size=batch_size,
             steps=steps,
             dim=self.relation_parameter_dim,
@@ -557,17 +446,19 @@ class Map4DDiT(nn.Module):
         )
 
         if self.map_name == "StackCube-v1":
-            return Map4d_StackCube(sizes, positions, rotations, clip_model=None)
+            return Map4d_StackCube(positions, rotations, sizes, relations, clip_model=None)
         if self.map_name == "PlugCharger-v1":
             return Map4d_PlugCharger(positions, rotations, sizes, relations, clip_model=None)
         raise ValueError(f"Unsupported map_name={self.map_name!r}")
 
     def _encoded_map_nodes_from_gt(self, obs: Dict[str, torch.Tensor]) -> torch.Tensor:
-        node_poses = obs["node_poses"]
-        if node_poses.ndim == 3:
-            batch_size, steps = node_poses.shape[0], 1
+        node_position = obs.get("node_position", obs.get("node_poses"))
+        if node_position is None:
+            raise ValueError("Map4DDiT requires obs.node_position")
+        if node_position.ndim == 3:
+            batch_size, steps = node_position.shape[0], 1
         else:
-            batch_size, steps = node_poses.shape[:2]
+            batch_size, steps = node_position.shape[:2]
         rep = self._map_representation_from_gt(obs)
         encoded = self.map_encoder(rep)
         if encoded.ndim != 3:
@@ -579,7 +470,7 @@ class Map4DDiT(nn.Module):
         if stale_keys:
             raise ValueError(
                 "Map4DDiT no longer accepts precomputed map features or map graphs in obs; "
-                f"remove {sorted(stale_keys)} and pass GT obs.node_poses/size_parameters/relation_parameters."
+                f"remove {sorted(stale_keys)} and pass GT obs.node_position/node_rotation/size_parameters/relation_parameters."
             )
 
         encoded_map_nodes = self._encoded_map_nodes_from_gt(obs)
@@ -609,22 +500,6 @@ class Map4DDiT(nn.Module):
         map_token = map_token + self.source_embed[1]
         return map_xyz.reshape(map_xyz.shape[0], -1, 3), map_token.reshape(map_token.shape[0], -1, self.embed_dim)
 
-    def _context_field(self, obs: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        global_cond = self._global_condition(obs)
-        semantic_xyz, semantic_token = self._semantic_context(obs)
-        map_xyz, map_token = self._map_context(obs)
-        context_xyz = torch.cat([semantic_xyz, map_xyz], dim=1)
-        context_token = torch.cat([semantic_token, map_token], dim=1)
-        if context_token.shape[1] > self.max_context_tokens:
-            raise ValueError(
-                f"Context token count {context_token.shape[1]} exceeds max_context_tokens={self.max_context_tokens}"
-            )
-        return context_xyz, context_token, global_cond
-
-    def _finalize(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
-        shift, scale = self.final_modulation(cond).chunk(2, dim=-1)
-        return _modulate(self.final_norm(x), shift, scale)
-
     @staticmethod
     def _to_seq(x: torch.Tensor) -> torch.Tensor:
         return x.transpose(0, 1)
@@ -635,13 +510,7 @@ class Map4DDiT(nn.Module):
 
     def _prepare_targets(self, noisy_targets: Dict[str, torch.Tensor]):
         trajectory = noisy_targets["trajectory"]
-        keyframe_node = noisy_targets.get(
-            "keyframe_node",
-            noisy_targets.get("keyframe_map4d", noisy_targets.get("keyframe_object")),
-        )
         keyframe_tcp = noisy_targets["keyframe_tcp"]
-        if keyframe_node is None:
-            raise ValueError("noisy_targets must include keyframe_node or keyframe_map4d")
 
         squeeze_trajectory_arm = False
         squeeze_tcp_arm = False
@@ -657,20 +526,33 @@ class Map4DDiT(nn.Module):
                 "trajectory must have shape "
                 f"[B, {self.num_arms}, {self.action_horizon}, {self.trajectory_dim}], got {trajectory.shape}"
             )
-        if keyframe_node.shape[1:] != (self.keyframe_horizon, self.num_target_nodes, self.node_dim):
-            raise ValueError(
-                "keyframe_node/keyframe_map4d must have shape "
-                f"[B, {self.keyframe_horizon}, {self.num_target_nodes}, {self.node_dim}], "
-                f"got {keyframe_node.shape}"
-            )
         if keyframe_tcp.shape[1:] != (self.num_arms, self.keyframe_horizon, self.tcp_dim):
             raise ValueError(
                 "keyframe_tcp must have shape "
                 f"[B, {self.num_arms}, {self.keyframe_horizon}, {self.tcp_dim}], got {keyframe_tcp.shape}"
             )
-        return trajectory, keyframe_node, keyframe_tcp, squeeze_trajectory_arm, squeeze_tcp_arm
+        return trajectory, keyframe_tcp, squeeze_trajectory_arm, squeeze_tcp_arm
 
-    def _target_tokens(self, trajectory, keyframe_node, keyframe_tcp):
+    def _keyframe_node_queries(self, obs: Dict[str, torch.Tensor], batch_size: int, device, dtype):
+        node_position = obs.get("node_position")
+        if node_position is None:
+            node_poses = obs.get("node_poses")
+            if node_poses is None:
+                raise ValueError("Map4DDiT requires obs.node_position for keyframe node queries")
+            node_position = node_poses[..., 0:3]
+        if node_position.ndim == 3:
+            node_position = node_position[:, None]
+        if node_position.ndim != 4 or node_position.shape[-1] != self.point_dim:
+            raise ValueError(f"obs.node_position must have shape [B,T,N,3], got {node_position.shape}")
+        if node_position.shape[0] != batch_size or node_position.shape[2] != self.num_target_nodes:
+            raise ValueError(
+                f"obs.node_position must have [B,N]=[{batch_size},{self.num_target_nodes}], "
+                f"got {node_position.shape}"
+            )
+        current_node_position = node_position[:, -1].to(device=device, dtype=dtype)
+        return current_node_position[:, None].expand(-1, self.keyframe_horizon, -1, -1)
+
+    def _target_tokens(self, trajectory, keyframe_node_position, keyframe_tcp):
         batch_size = trajectory.shape[0]
 
         traj_tokens = self.trajectory_proj(trajectory)
@@ -679,10 +561,10 @@ class Map4DDiT(nn.Module):
         traj_xyz = trajectory[..., :3].reshape(batch_size, -1, 3)
         traj_tokens = traj_tokens.reshape(batch_size, -1, self.embed_dim)
 
-        node_tokens = self.node_proj(keyframe_node)
+        node_tokens = self.node_proj(keyframe_node_position)
         node_tokens = node_tokens + self.keyframe_time_embed + self.node_id_embed
         node_tokens = node_tokens + self.target_type_embed[1]
-        node_xyz = keyframe_node[..., :3].reshape(batch_size, -1, 3)
+        node_xyz = keyframe_node_position.reshape(batch_size, -1, self.point_dim)
         node_tokens = node_tokens.reshape(batch_size, -1, self.embed_dim)
 
         tcp_tokens = self.tcp_proj(keyframe_tcp)
@@ -712,58 +594,121 @@ class Map4DDiT(nn.Module):
             module(query=query_seq, query_pos=self.relative_pe_layer(query_xyz), diff_ts=cond)[-1]
         )
 
+    def encode_denoising_timestep(self, timestep, state_feat):
+        time_feats = self.time_encoder(timestep)
+        state_feat = state_feat[:, -self.obs_horizon :]
+        if state_feat.shape[1] < self.obs_horizon:
+            pad = state_feat[:, :1].expand(-1, self.obs_horizon - state_feat.shape[1], -1)
+            state_feat = torch.cat([pad, state_feat], dim=1)
+        return time_feats + state_feat.mean(dim=1)
+
+    def prediction_head(
+        self,
+        traj_tokens,
+        traj_xyz,
+        node_tokens,
+        node_xyz,
+        tcp_tokens,
+        tcp_xyz,
+        context_xyz,
+        context_token,
+        sampled_context_xyz,
+        sampled_context_token,
+        timestep,
+        state_feat,
+    ):
+        cond = self.encode_denoising_timestep(timestep, state_feat)
+
+        node_feat = self._cross_context(
+            self.node_context_attn, node_tokens, node_xyz, context_token, context_xyz, cond
+        )
+        node_plan = torch.cat([node_feat, sampled_context_token], dim=1)
+        node_plan_xyz = torch.cat([node_xyz, sampled_context_xyz], dim=1)
+        node_plan = self._self_attention(self.node_self_attn, node_plan, node_plan_xyz, cond)
+        node_feat = node_plan[:, : node_tokens.shape[1]]
+
+        node_condition = node_plan.detach() if self.detach_stage_features else node_plan
+        node_condition_xyz = node_plan_xyz.detach() if self.detach_stage_features else node_plan_xyz
+        tcp_feat = self._cross_context(self.tcp_context_attn, tcp_tokens, tcp_xyz, context_token, context_xyz, cond)
+        tcp_plan = torch.cat([tcp_feat, node_condition], dim=1)
+        tcp_plan_xyz = torch.cat([tcp_xyz, node_condition_xyz], dim=1)
+        tcp_plan = self._self_attention(self.tcp_self_attn, tcp_plan, tcp_plan_xyz, cond)
+        tcp_feat = tcp_plan[:, : tcp_tokens.shape[1]]
+
+        tcp_condition = tcp_plan.detach() if self.detach_stage_features else tcp_plan
+        tcp_condition_xyz = tcp_plan_xyz.detach() if self.detach_stage_features else tcp_plan_xyz
+        traj_feat = self._cross_context(
+            self.action_context_attn, traj_tokens, traj_xyz, context_token, context_xyz, cond
+        )
+        action_plan = torch.cat([traj_feat, tcp_condition], dim=1)
+        action_plan_xyz = torch.cat([traj_xyz, tcp_condition_xyz], dim=1)
+        action_plan = self._self_attention(self.action_self_attn, action_plan, action_plan_xyz, cond)
+        traj_feat = action_plan[:, : traj_tokens.shape[1]]
+        return traj_feat, node_feat, tcp_feat
+
     def forward(
         self,
         noisy_targets: Dict[str, torch.Tensor],
         timestep: Union[torch.Tensor, float, int],
         obs: Dict[str, torch.Tensor],
     ) -> Dict[str, torch.Tensor]:
-        trajectory, keyframe_node, keyframe_tcp, squeeze_trajectory_arm, squeeze_tcp_arm = self._prepare_targets(
+        trajectory, keyframe_tcp, squeeze_trajectory_arm, squeeze_tcp_arm = self._prepare_targets(
             noisy_targets
         )
         batch_size = trajectory.shape[0]
         device = trajectory.device
-        context_xyz, context_token, global_cond = self._context_field(obs)
         timesteps = self._make_timestep(timestep, batch_size, device)
-        cond = self.time_encoder(timesteps) + global_cond
+
+        (
+            semantic_xyz,
+            semantic_token,
+            _lang_feat,
+            state_feat,
+            sampled_semantic_xyz,
+            sampled_semantic_token,
+        ) = self._observation_context(obs)
+        map_xyz, map_token = self._map_context(obs)
+        context_xyz = torch.cat([semantic_xyz, map_xyz], dim=1)
+        context_token = torch.cat([semantic_token, map_token], dim=1)
+        sampled_context_xyz = torch.cat([sampled_semantic_xyz, map_xyz], dim=1)
+        sampled_context_token = torch.cat([sampled_semantic_token, map_token], dim=1)
+
+        keyframe_node_position = self._keyframe_node_queries(obs, batch_size, device, trajectory.dtype)
 
         traj_tokens, traj_xyz, node_tokens, node_xyz, tcp_tokens, tcp_xyz = self._target_tokens(
-            trajectory, keyframe_node, keyframe_tcp
+            trajectory, keyframe_node_position, keyframe_tcp
         )
-
-        node_feat = self._cross_context(
-            self.node_context_attn, node_tokens, node_xyz, context_token, context_xyz, cond
+        traj_feat, node_feat, tcp_feat = self.prediction_head(
+            traj_tokens=traj_tokens,
+            traj_xyz=traj_xyz,
+            node_tokens=node_tokens,
+            node_xyz=node_xyz,
+            tcp_tokens=tcp_tokens,
+            tcp_xyz=tcp_xyz,
+            context_xyz=context_xyz,
+            context_token=context_token,
+            sampled_context_xyz=sampled_context_xyz,
+            sampled_context_token=sampled_context_token,
+            timestep=timesteps,
+            state_feat=state_feat,
         )
-        node_feat = self._self_attention(self.node_self_attn, node_feat, node_xyz, cond)
+        cond = self.encode_denoising_timestep(timesteps, state_feat)
+        shift, scale = self.final_modulation(cond).chunk(2, dim=-1)
+        node_feat = self.final_norm(node_feat) * (1 + scale[:, None]) + shift[:, None]
+        tcp_feat = self.final_norm(tcp_feat) * (1 + scale[:, None]) + shift[:, None]
+        traj_feat = self.final_norm(traj_feat) * (1 + scale[:, None]) + shift[:, None]
 
-        node_condition = node_feat.detach() if self.detach_stage_features else node_feat
-        tcp_feat = self._cross_context(self.tcp_context_attn, tcp_tokens, tcp_xyz, context_token, context_xyz, cond)
-        tcp_with_node = torch.cat([tcp_feat, node_condition], dim=1)
-        tcp_with_node_xyz = torch.cat([tcp_xyz, node_xyz], dim=1)
-        tcp_with_node = self._self_attention(self.tcp_self_attn, tcp_with_node, tcp_with_node_xyz, cond)
-        tcp_feat = tcp_with_node[:, : tcp_tokens.shape[1]]
-
-        tcp_condition = tcp_feat.detach() if self.detach_stage_features else tcp_feat
-        action_feat = self._cross_context(
-            self.action_context_attn, traj_tokens, traj_xyz, context_token, context_xyz, cond
-        )
-        action_with_plan = torch.cat([action_feat, node_condition, tcp_condition], dim=1)
-        action_with_plan_xyz = torch.cat([traj_xyz, node_xyz, tcp_xyz], dim=1)
-        action_with_plan = self._self_attention(self.action_self_attn, action_with_plan, action_with_plan_xyz, cond)
-        traj_feat = action_with_plan[:, : traj_tokens.shape[1]]
-
-        node_feat = self._finalize(node_feat, cond)
-        tcp_feat = self._finalize(tcp_feat, cond)
-        traj_feat = self._finalize(traj_feat, cond)
-
-        pred_node = self.node_head(node_feat).reshape(
-            batch_size, self.keyframe_horizon, self.num_target_nodes, self.node_dim
+        pred_node_position = self.node_head(node_feat).reshape(
+            batch_size, self.keyframe_horizon, self.num_target_nodes, self.point_dim
         )
         pred_tcp = self.tcp_head(tcp_feat).reshape(batch_size, self.num_arms, self.keyframe_horizon, self.tcp_dim)
         pred_trajectory = self.trajectory_head(traj_feat).reshape(
             batch_size, self.num_arms, self.action_horizon, self.trajectory_dim
         )
-        pred_gripper = self.gripper_head(traj_feat).reshape(batch_size, self.num_arms, self.action_horizon, 1)
+        if self.gripper_head is None:
+            pred_gripper = pred_trajectory[..., 3:4]
+        else:
+            pred_gripper = self.gripper_head(traj_feat).reshape(batch_size, self.num_arms, self.action_horizon, 1)
 
         if squeeze_trajectory_arm:
             pred_trajectory = pred_trajectory[:, 0]
@@ -776,9 +721,10 @@ class Map4DDiT(nn.Module):
 
         return {
             "trajectory": pred_trajectory,
-            "keyframe_node": pred_node,
-            "keyframe_map4d": pred_node,
-            "keyframe_object": pred_node,
+            "keyframe_node_position": pred_node_position,
+            "keyframe_node": pred_node_position,
+            "keyframe_map4d": pred_node_position,
+            "keyframe_object": pred_node_position,
             "keyframe_tcp": pred_tcp,
             "gripper_openness": pred_gripper,
             "trajectory_features": traj_feat_out,

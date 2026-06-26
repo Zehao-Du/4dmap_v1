@@ -13,3 +13,6 @@
 [submodule "map4d/backbone/model/vision/dinov3"]
 	path = map4d/backbone/model/vision/dinov3
 	url = org-16943930@github.com:facebookresearch/dinov3.git
+[submodule "third_party/maniskill_map4d"]
+	path = third_party/maniskill_map4d
+	url = git@github.com:Zehao-Du/maniskill_map4d.git

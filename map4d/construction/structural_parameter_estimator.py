@@ -243,11 +243,11 @@ class PointNetEncoder(nn.Module):
 
 
 class StructuralParameterEstimator(nn.Module):
-    """Estimate object structural parameters from masked point clouds.
+    """
+    Estimate object structural parameters from masked point clouds.
 
-    The module follows the MapPolicy constructor style: task-specific output
-    dimensions and map classes are resolved from a registry, while the network
-    body stays generic. Register a new ``StructuralTaskSpec`` for each new map.
+    Input: pointcloud
+    Output: size parameter + relation parameter
     """
 
     def __init__(self, config: StructuralParameterEstimatorConfig):

@@ -136,7 +136,7 @@ Current extraction rules:
 
 ## Final GT-Map Sidecar HDF5
 
-The final sidecar is produced by `scripts/data_collection/DiTMap4D/build_map4d_context_dataset.py`.
+The final sidecar is produced by `scripts/data_collection/helpers/build_map4d_context_dataset.py`.
 
 It copies the raw keyframe sidecar and validates that the demo HDF5 contains:
 

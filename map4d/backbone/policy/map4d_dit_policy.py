@@ -10,7 +10,8 @@ from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 from omegaconf import OmegaConf
 
 from map4d.backbone.model.common.normalizer import LinearNormalizer
-from map4d.backbone.model.diffusion.map4d_dit import Map4DDiT, normalize_quaternion
+from map4d.backbone.model.diffusion.mask_generator import LowdimMaskGenerator
+from map4d.backbone.model.diffusion.map4d_dit import Map4DDiT
 from map4d.backbone.policy.base_policy import BasePolicy
 
 
@@ -69,232 +70,200 @@ class Map4DDiTPolicy(BasePolicy):
             "gripper": float(gripper_loss_weight),
         }
         self.normalizer = LinearNormalizer()
+        self.mask_generator = LowdimMaskGenerator(
+            action_dim=int(self.model.trajectory_dim),
+            obs_dim=0,
+            max_n_obs_steps=self.n_obs_steps,
+            fix_obs_steps=True,
+            action_visible=True,
+        )
 
-    def set_normalizer(self, normalizer: LinearNormalizer):
-        self.normalizer.load_state_dict(normalizer.state_dict())
-
-    def _has_norm(self, key: str) -> bool:
-        return key in self.normalizer.params_dict
-
-    def _normalize(self, key: str, value: torch.Tensor) -> torch.Tensor:
-        if self._has_norm(key):
-            return self.normalizer[key].normalize(value)
-        return value
-
-    def _unnormalize(self, key: str, value: torch.Tensor) -> torch.Tensor:
-        if self._has_norm(key):
-            return self.normalizer[key].unnormalize(value)
-        return value
-
-    def _normalize_obs(self, obs: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        out = {key: value.to(device=self.device, dtype=self.dtype) for key, value in obs.items()}
-        if "robot_state" in out:
-            out["robot_state"] = self._normalize("robot_state", out["robot_state"])
-        return out
-
-    def _normalize_targets(self, batch) -> Dict[str, torch.Tensor]:
-        trajectory = batch["action"]["trajectory"].clone()
-        trajectory[..., 0:3] = self._normalize("trajectory_pos", trajectory[..., 0:3])
-        trajectory[..., 3:7] = normalize_quaternion(trajectory[..., 3:7])
-
-        keyframe_map4d = batch["keyframe"]["map4d"].clone()
-        keyframe_map4d[..., 0:3] = self._normalize("keyframe_map4d_pos", keyframe_map4d[..., 0:3])
-
-        keyframe_tcp = batch["keyframe"]["tcp"].clone()
-        keyframe_tcp[..., 0:3] = self._normalize("keyframe_tcp_pos", keyframe_tcp[..., 0:3])
-        if keyframe_tcp.shape[-1] == 7:
-            keyframe_tcp[..., 3:7] = normalize_quaternion(keyframe_tcp[..., 3:7])
-        elif keyframe_tcp.shape[-1] == 4:
-            keyframe_tcp[..., 3:4] = self._normalize(
-                "keyframe_tcp_gripper", keyframe_tcp[..., 3:4]
+    def _normalize_trajectory(self, trajectory: torch.Tensor) -> torch.Tensor:
+        if trajectory.shape[-1] == 4:
+            return torch.cat(
+                [
+                    self.normalizer["trajectory_pos"].normalize(trajectory[..., 0:3]),
+                    self.normalizer["gripper_openness"].normalize(trajectory[..., 3:4]),
+                ],
+                dim=-1,
             )
-        else:
-            raise ValueError(f"Unsupported keyframe TCP dim {keyframe_tcp.shape[-1]}")
-
-        gripper = batch["action"]["gripper_openness"].clone()
-        gripper = self._normalize("gripper_openness", gripper)
-        return {
-            "trajectory": trajectory,
-            "keyframe_map4d": keyframe_map4d,
-            "keyframe_tcp": keyframe_tcp,
-            "gripper_openness": gripper,
-        }
+        if trajectory.shape[-1] == 7:
+            return torch.cat(
+                [
+                    self.normalizer["trajectory_pos"].normalize(trajectory[..., 0:3]),
+                    trajectory[..., 3:7],
+                ],
+                dim=-1,
+            )
+        raise ValueError(f"Unsupported trajectory dim {trajectory.shape[-1]}")
 
     def _unnormalize_trajectory(self, trajectory: torch.Tensor) -> torch.Tensor:
-        out = trajectory.clone()
-        out[..., 0:3] = self._unnormalize("trajectory_pos", out[..., 0:3])
-        out[..., 3:7] = normalize_quaternion(out[..., 3:7])
-        return out
+        if trajectory.shape[-1] == 4:
+            return torch.cat(
+                [
+                    self.normalizer["trajectory_pos"].unnormalize(trajectory[..., 0:3]),
+                    self.normalizer["gripper_openness"].unnormalize(trajectory[..., 3:4]),
+                ],
+                dim=-1,
+            )
+        if trajectory.shape[-1] == 7:
+            return torch.cat(
+                [
+                    self.normalizer["trajectory_pos"].unnormalize(trajectory[..., 0:3]),
+                    trajectory[..., 3:7],
+                ],
+                dim=-1,
+            )
+        raise ValueError(f"Unsupported trajectory dim {trajectory.shape[-1]}")
 
-    def _unnormalize_gripper(self, gripper: torch.Tensor) -> torch.Tensor:
-        return self._unnormalize("gripper_openness", gripper)
-
-    def _add_noise(self, targets: Dict[str, torch.Tensor], timesteps: torch.Tensor):
-        trajectory = targets["trajectory"]
-        keyframe_map4d = targets["keyframe_map4d"]
-        keyframe_tcp = targets["keyframe_tcp"]
-        noise = {
-            "trajectory": torch.randn_like(trajectory),
-            "keyframe_map4d": torch.randn_like(keyframe_map4d),
-            "keyframe_tcp": torch.randn_like(keyframe_tcp),
-        }
-
-        noisy_trajectory = torch.cat(
-            [
-                self.position_noise_scheduler.add_noise(
-                    trajectory[..., 0:3], noise["trajectory"][..., 0:3], timesteps
-                ),
-                normalize_quaternion(
-                    self.rotation_noise_scheduler.add_noise(
-                        trajectory[..., 3:7], noise["trajectory"][..., 3:7], timesteps
-                    )
-                ),
-            ],
-            dim=-1,
-        )
-        noisy_map4d = torch.cat(
-            [
-                self.position_noise_scheduler.add_noise(
-                    keyframe_map4d[..., 0:3], noise["keyframe_map4d"][..., 0:3], timesteps
-                ),
-                self.rotation_noise_scheduler.add_noise(
-                    keyframe_map4d[..., 3:9], noise["keyframe_map4d"][..., 3:9], timesteps
-                ),
-            ],
-            dim=-1,
-        )
-        tcp_pos = self.position_noise_scheduler.add_noise(
-            keyframe_tcp[..., 0:3], noise["keyframe_tcp"][..., 0:3], timesteps
-        )
+    def _normalize_keyframe_tcp(self, keyframe_tcp: torch.Tensor) -> torch.Tensor:
+        if keyframe_tcp.shape[-1] == 4:
+            return torch.cat(
+                [
+                    self.normalizer["keyframe_tcp_pos"].normalize(keyframe_tcp[..., 0:3]),
+                    self.normalizer["keyframe_tcp_gripper"].normalize(keyframe_tcp[..., 3:4]),
+                ],
+                dim=-1,
+            )
         if keyframe_tcp.shape[-1] == 7:
-            tcp_tail = normalize_quaternion(
-                self.rotation_noise_scheduler.add_noise(
-                    keyframe_tcp[..., 3:7], noise["keyframe_tcp"][..., 3:7], timesteps
-                )
+            return torch.cat(
+                [
+                    self.normalizer["keyframe_tcp_pos"].normalize(keyframe_tcp[..., 0:3]),
+                    keyframe_tcp[..., 3:7],
+                ],
+                dim=-1,
             )
-        elif keyframe_tcp.shape[-1] == 4:
-            tcp_tail = self.position_noise_scheduler.add_noise(
-                keyframe_tcp[..., 3:4], noise["keyframe_tcp"][..., 3:4], timesteps
+        raise ValueError(f"Unsupported keyframe TCP dim {keyframe_tcp.shape[-1]}")
+
+    def _unnormalize_keyframe_tcp(self, keyframe_tcp: torch.Tensor) -> torch.Tensor:
+        if keyframe_tcp.shape[-1] == 4:
+            return torch.cat(
+                [
+                    self.normalizer["keyframe_tcp_pos"].unnormalize(keyframe_tcp[..., 0:3]),
+                    self.normalizer["keyframe_tcp_gripper"].unnormalize(keyframe_tcp[..., 3:4]),
+                ],
+                dim=-1,
             )
+        if keyframe_tcp.shape[-1] == 7:
+            return torch.cat(
+                [
+                    self.normalizer["keyframe_tcp_pos"].unnormalize(keyframe_tcp[..., 0:3]),
+                    keyframe_tcp[..., 3:7],
+                ],
+                dim=-1,
+            )
+        raise ValueError(f"Unsupported keyframe TCP dim {keyframe_tcp.shape[-1]}")
+
+    # ========= inference / testing ============
+    @torch.no_grad()
+    def conditional_sample_map4d_dit(
+        self,
+        condition_data: torch.Tensor,
+        condition_mask: torch.Tensor,
+        obs: Dict[str, torch.Tensor],
+    ):
+        """Testing denoising loop, matching PPI's conditional_sample_* entry."""
+        self.position_noise_scheduler.set_timesteps(self.num_inference_steps)
+        self.rotation_noise_scheduler.set_timesteps(self.num_inference_steps)
+
+        batch_size = condition_data.shape[0]
+        device = condition_data.device
+        dtype = condition_data.dtype
+        num_arms = int(getattr(self.model, "num_arms", 1))
+
+        if num_arms == 1:
+            tcp_shape = (batch_size, self.keyframe_horizon, self.model.tcp_dim)
         else:
-            raise ValueError(f"Unsupported keyframe TCP dim {keyframe_tcp.shape[-1]}")
-        noisy_tcp = torch.cat([tcp_pos, tcp_tail], dim=-1)
-        noisy = {
-            "trajectory": noisy_trajectory,
-            "keyframe_map4d": noisy_map4d,
-            "keyframe_tcp": noisy_tcp,
-        }
-        return noisy, noise
+            tcp_shape = (batch_size, num_arms, self.keyframe_horizon, self.model.tcp_dim)
 
-    def forward(self, batch):
-        obs = self._normalize_obs(batch["obs"])
-        targets = self._normalize_targets(batch)
-        batch_size = targets["trajectory"].shape[0]
-        timesteps = torch.randint(
-            0,
-            self.noise_scheduler_cfg.num_train_timesteps,
-            (batch_size,),
-            device=targets["trajectory"].device,
-        ).long()
+        trajectory = torch.randn_like(condition_data)
+        keyframe_tcp = torch.randn(*tcp_shape, device=device, dtype=dtype)
+        if condition_data.shape[-1] == 4:
+            trajectory[..., 3:4].zero_()
+        trajectory = torch.where(condition_mask, condition_data, trajectory)
 
-        noisy, noise = self._add_noise(targets, timesteps)
-        pred = self.model(noisy, timesteps, obs)
+        sample = {"trajectory": trajectory, "keyframe_tcp": keyframe_tcp}
+        latest_pred = None
+        for t in self.position_noise_scheduler.timesteps:
+            timestep = t * torch.ones(batch_size, device=device, dtype=torch.long)
+            latest_pred = self.model(sample, timestep, obs)
 
-        trajectory_loss = F.l1_loss(pred["trajectory"], noise["trajectory"])
-        keyframe_tcp_loss = F.l1_loss(pred["keyframe_tcp"], noise["keyframe_tcp"])
-        keyframe_map4d_loss = F.l1_loss(pred["keyframe_map4d"], noise["keyframe_map4d"])
-        gripper_loss = F.l1_loss(pred["gripper_openness"], targets["gripper_openness"])
-        total_loss = (
-            self.loss_weights["trajectory"] * trajectory_loss
-            + self.loss_weights["keyframe_tcp"] * keyframe_tcp_loss
-            + self.loss_weights["keyframe_map4d"] * keyframe_map4d_loss
-            + self.loss_weights["gripper"] * gripper_loss
-        )
-        return total_loss, {
-            "bc_loss": float(total_loss.detach().cpu()),
-            "trajectory_noise_l1": float(trajectory_loss.detach().cpu()),
-            "keyframe_tcp_noise_l1": float(keyframe_tcp_loss.detach().cpu()),
-            "keyframe_map4d_noise_l1": float(keyframe_map4d_loss.detach().cpu()),
-            "gripper_l1": float(gripper_loss.detach().cpu()),
-        }
-
-    def _sample_step(self, sample, pred, t):
-        trajectory_pos = self.position_noise_scheduler.step(
-            pred["trajectory"][..., 0:3], t, sample["trajectory"][..., 0:3]
-        ).prev_sample
-        trajectory_quat = self.rotation_noise_scheduler.step(
-            pred["trajectory"][..., 3:7], t, sample["trajectory"][..., 3:7]
-        ).prev_sample
-        map4d_pos = self.position_noise_scheduler.step(
-            pred["keyframe_map4d"][..., 0:3], t, sample["keyframe_map4d"][..., 0:3]
-        ).prev_sample
-        map4d_rot = self.rotation_noise_scheduler.step(
-            pred["keyframe_map4d"][..., 3:9], t, sample["keyframe_map4d"][..., 3:9]
-        ).prev_sample
-        tcp_pos = self.position_noise_scheduler.step(
-            pred["keyframe_tcp"][..., 0:3], t, sample["keyframe_tcp"][..., 0:3]
-        ).prev_sample
-        if sample["keyframe_tcp"].shape[-1] == 7:
-            tcp_tail = normalize_quaternion(
-                self.rotation_noise_scheduler.step(
-                    pred["keyframe_tcp"][..., 3:7], t, sample["keyframe_tcp"][..., 3:7]
-                ).prev_sample
-            )
-        elif sample["keyframe_tcp"].shape[-1] == 4:
-            tcp_tail = self.position_noise_scheduler.step(
-                pred["keyframe_tcp"][..., 3:4], t, sample["keyframe_tcp"][..., 3:4]
+            trajectory_pos = self.position_noise_scheduler.step(
+                latest_pred["trajectory"][..., 0:3], t, sample["trajectory"][..., 0:3]
             ).prev_sample
-        else:
-            raise ValueError(f"Unsupported keyframe TCP dim {sample['keyframe_tcp'].shape[-1]}")
-        return {
-            "trajectory": torch.cat([trajectory_pos, normalize_quaternion(trajectory_quat)], dim=-1),
-            "keyframe_map4d": torch.cat([map4d_pos, map4d_rot], dim=-1),
-            "keyframe_tcp": torch.cat([tcp_pos, tcp_tail], dim=-1),
-        }
+            if sample["trajectory"].shape[-1] == 7:
+                trajectory_tail = self.rotation_noise_scheduler.step(
+                    latest_pred["trajectory"][..., 3:7], t, sample["trajectory"][..., 3:7]
+                ).prev_sample
+            elif sample["trajectory"].shape[-1] == 4:
+                trajectory_tail = torch.zeros_like(latest_pred["trajectory"][..., 3:4])
+            else:
+                raise ValueError(f"Unsupported trajectory dim {sample['trajectory'].shape[-1]}")
+
+            tcp_pos = self.position_noise_scheduler.step(
+                latest_pred["keyframe_tcp"][..., 0:3], t, sample["keyframe_tcp"][..., 0:3]
+            ).prev_sample
+            if sample["keyframe_tcp"].shape[-1] == 7:
+                tcp_tail = self.rotation_noise_scheduler.step(
+                    latest_pred["keyframe_tcp"][..., 3:7], t, sample["keyframe_tcp"][..., 3:7]
+                ).prev_sample
+            elif sample["keyframe_tcp"].shape[-1] == 4:
+                tcp_tail = self.position_noise_scheduler.step(
+                    latest_pred["keyframe_tcp"][..., 3:4], t, sample["keyframe_tcp"][..., 3:4]
+                ).prev_sample
+            else:
+                raise ValueError(f"Unsupported keyframe TCP dim {sample['keyframe_tcp'].shape[-1]}")
+
+            trajectory = torch.cat([trajectory_pos, trajectory_tail], dim=-1)
+            trajectory = torch.where(condition_mask, condition_data, trajectory)
+            sample = {
+                "trajectory": trajectory,
+                "keyframe_tcp": torch.cat([tcp_pos, tcp_tail], dim=-1),
+            }
+        return sample, latest_pred
 
     @torch.no_grad()
     def predict_action(self, obs_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        obs = self._normalize_obs(obs_dict)
-        value = obs["robot_state"]
+        """Testing entry: normalize obs, then denoise action/TCP."""
+        nobs = {
+            key: self.normalizer.normalize({key: value})[key] if key in self.normalizer.params_dict else value
+            for key, value in obs_dict.items()
+        }
+        value = nobs["robot_state"]
         batch_size = value.shape[0]
         device = self.device
         dtype = self.dtype
         num_arms = int(getattr(self.model, "num_arms", 1))
 
         if num_arms == 1:
-            trajectory_shape = (batch_size, self.action_horizon, 7)
-            tcp_shape = (batch_size, self.keyframe_horizon, self.model.tcp_dim)
+            trajectory_shape = (batch_size, self.action_horizon, int(self.model.trajectory_dim))
         else:
-            trajectory_shape = (batch_size, num_arms, self.action_horizon, 7)
-            tcp_shape = (batch_size, num_arms, self.keyframe_horizon, self.model.tcp_dim)
+            trajectory_shape = (batch_size, num_arms, self.action_horizon, int(self.model.trajectory_dim))
 
-        sample = {
-            "trajectory": torch.randn(*trajectory_shape, device=device, dtype=dtype),
-            "keyframe_map4d": torch.randn(
-                batch_size,
-                self.keyframe_horizon,
-                self.model.num_objects,
-                9,
-                device=device,
-                dtype=dtype,
-            ),
-            "keyframe_tcp": torch.randn(*tcp_shape, device=device, dtype=dtype),
-        }
-        sample["trajectory"][..., 3:7] = normalize_quaternion(sample["trajectory"][..., 3:7])
-        if self.model.tcp_dim == 7:
-            sample["keyframe_tcp"][..., 3:7] = normalize_quaternion(sample["keyframe_tcp"][..., 3:7])
+        condition_data = torch.zeros(*trajectory_shape, device=device, dtype=dtype)
+        condition_mask = torch.zeros_like(condition_data, dtype=torch.bool)
+        sample, latest_pred = self.conditional_sample_map4d_dit(condition_data, condition_mask, nobs)
 
-        self.position_noise_scheduler.set_timesteps(self.num_inference_steps)
-        self.rotation_noise_scheduler.set_timesteps(self.num_inference_steps)
-        latest_pred = None
-        for t in self.position_noise_scheduler.timesteps:
-            timestep = t * torch.ones(batch_size, device=device, dtype=torch.long)
-            latest_pred = self.model(sample, timestep, obs)
-            sample = self._sample_step(sample, latest_pred, t)
+        ntrajectory_pred = sample["trajectory"].clone()
+        if ntrajectory_pred.shape[-1] == 7:
+            ngripper_pred = latest_pred["gripper_openness"]
+            trajectory_pred = self._unnormalize_trajectory(ntrajectory_pred)
+            gripper_pred = self.normalizer["gripper_openness"].unnormalize(ngripper_pred)
+            action_pred = torch.cat([trajectory_pred, gripper_pred], dim=-1)
+        elif ntrajectory_pred.shape[-1] == 4:
+            ngripper_pred = latest_pred["trajectory"][..., 3:4]
+            ntrajectory_pred[..., 3:4] = ngripper_pred
+            trajectory_pred = self._unnormalize_trajectory(ntrajectory_pred)
+            gripper_pred = trajectory_pred[..., 3:4]
+            action_pred = trajectory_pred
+        else:
+            raise ValueError(f"Unsupported trajectory dim {ntrajectory_pred.shape[-1]}")
 
-        trajectory_pred = self._unnormalize_trajectory(sample["trajectory"])
-        gripper_pred = self._unnormalize_gripper(latest_pred["gripper_openness"])
-        action_pred = torch.cat([trajectory_pred, gripper_pred], dim=-1)
+        keyframe_node_position_pred = self.normalizer["keyframe_map4d_pos"].unnormalize(
+            latest_pred["keyframe_node_position"]
+        )
+        keyframe_tcp_latent = self._unnormalize_keyframe_tcp(sample["keyframe_tcp"])
+
         if num_arms == 1:
             action = action_pred[:, : self.n_action_steps]
         else:
@@ -304,6 +273,112 @@ class Map4DDiTPolicy(BasePolicy):
             "action_pred": action_pred,
             "trajectory_pred": trajectory_pred,
             "gripper_openness_pred": gripper_pred,
-            "keyframe_map4d_latent": sample["keyframe_map4d"],
-            "keyframe_tcp_latent": sample["keyframe_tcp"],
+            "keyframe_node_position_pred": keyframe_node_position_pred,
+            "keyframe_tcp_latent": keyframe_tcp_latent,
+        }
+
+    # ========= training ============
+    def set_normalizer(self, normalizer: LinearNormalizer):
+        """Training setup: copy dataset normalizer into the policy."""
+        self.normalizer.load_state_dict(normalizer.state_dict())
+
+    def forward(self, batch):
+        """Training entry: normalize obs, add diffusion noise, predict noise, compute losses."""
+        nobs = self.normalizer.normalize(batch["obs"])
+        ntrajectory = self._normalize_trajectory(batch["action"]["trajectory"])
+        if ntrajectory.shape[-1] not in {4, 7}:
+            raise ValueError(f"Unsupported trajectory dim {ntrajectory.shape[-1]}")
+
+        nkeyframe_node_position = self.normalizer["keyframe_map4d_pos"].normalize(
+            batch["keyframe"]["map4d"][..., 0:3]
+        )
+
+        nkeyframe_tcp = self._normalize_keyframe_tcp(batch["keyframe"]["tcp"])
+        if nkeyframe_tcp.shape[-1] not in {4, 7}:
+            raise ValueError(f"Unsupported keyframe TCP dim {nkeyframe_tcp.shape[-1]}")
+
+        if ntrajectory.shape[-1] == 4:
+            ngripper = ntrajectory[..., 3:4]
+        else:
+            ngripper = self.normalizer["gripper_openness"].normalize(batch["action"]["gripper_openness"])
+
+        batch_size = ntrajectory.shape[0]
+        timesteps = torch.randint(
+            0,
+            self.noise_scheduler_cfg.num_train_timesteps,
+            (batch_size,),
+            device=ntrajectory.device,
+        ).long()
+
+        noise = {
+            "trajectory": torch.randn_like(ntrajectory),
+            "keyframe_tcp": torch.randn_like(nkeyframe_tcp),
+        }
+        trajectory_pos = self.position_noise_scheduler.add_noise(
+            ntrajectory[..., 0:3], noise["trajectory"][..., 0:3], timesteps
+        )
+        if ntrajectory.shape[-1] == 7:
+            trajectory_tail = self.rotation_noise_scheduler.add_noise(
+                ntrajectory[..., 3:7], noise["trajectory"][..., 3:7], timesteps
+            )
+        else:
+            trajectory_tail = torch.zeros_like(ntrajectory[..., 3:4])
+            noise["trajectory"][..., 3:4].zero_()
+        tcp_pos = self.position_noise_scheduler.add_noise(
+            nkeyframe_tcp[..., 0:3], noise["keyframe_tcp"][..., 0:3], timesteps
+        )
+        if nkeyframe_tcp.shape[-1] == 7:
+            tcp_tail = self.rotation_noise_scheduler.add_noise(
+                nkeyframe_tcp[..., 3:7], noise["keyframe_tcp"][..., 3:7], timesteps
+            )
+        else:
+            tcp_tail = self.position_noise_scheduler.add_noise(
+                nkeyframe_tcp[..., 3:4], noise["keyframe_tcp"][..., 3:4], timesteps
+            )
+
+        noisy = {
+            "trajectory": torch.cat([trajectory_pos, trajectory_tail], dim=-1),
+            "keyframe_tcp": torch.cat([tcp_pos, tcp_tail], dim=-1),
+        }
+        condition_mask = self.mask_generator(ntrajectory.shape)
+        if ntrajectory.shape[-1] == 4:
+            condition_mask = condition_mask.clone()
+            condition_mask[..., 3:4] = False
+        noisy["trajectory"] = torch.where(condition_mask, ntrajectory, noisy["trajectory"])
+        pred = self.model(noisy, timesteps, nobs)
+
+        trajectory_pos_loss = F.l1_loss(pred["trajectory"][..., 0:3], noise["trajectory"][..., 0:3])
+        if ntrajectory.shape[-1] == 7:
+            trajectory_rot_loss = F.l1_loss(pred["trajectory"][..., 3:7], noise["trajectory"][..., 3:7])
+            trajectory_loss = F.l1_loss(pred["trajectory"], noise["trajectory"])
+            gripper_loss = F.l1_loss(pred["gripper_openness"], ngripper)
+        else:
+            trajectory_rot_loss = pred["trajectory"].new_tensor(0.0)
+            trajectory_loss = trajectory_pos_loss
+            gripper_loss = F.l1_loss(pred["trajectory"][..., 3:4], ntrajectory[..., 3:4])
+
+        if nkeyframe_tcp.shape[-1] == 7:
+            keyframe_tcp_pos_loss = F.l1_loss(pred["keyframe_tcp"][..., 0:3], noise["keyframe_tcp"][..., 0:3])
+            keyframe_tcp_rot_loss = F.l1_loss(pred["keyframe_tcp"][..., 3:7], noise["keyframe_tcp"][..., 3:7])
+        else:
+            keyframe_tcp_pos_loss = F.l1_loss(pred["keyframe_tcp"][..., 0:3], noise["keyframe_tcp"][..., 0:3])
+            keyframe_tcp_rot_loss = pred["keyframe_tcp"].new_tensor(0.0)
+        keyframe_tcp_loss = F.l1_loss(pred["keyframe_tcp"], noise["keyframe_tcp"])
+        keyframe_node_position_loss = F.l1_loss(pred["keyframe_node_position"], nkeyframe_node_position)
+        total_loss = (
+            self.loss_weights["trajectory"] * trajectory_loss
+            + self.loss_weights["keyframe_tcp"] * keyframe_tcp_loss
+            + self.loss_weights["keyframe_map4d"] * keyframe_node_position_loss
+            + self.loss_weights["gripper"] * gripper_loss
+        )
+        return total_loss, {
+            "bc_loss": float(total_loss.detach().cpu()),
+            "trajectory_noise_l1": float(trajectory_loss.detach().cpu()),
+            "trajectory_pos_noise_l1": float(trajectory_pos_loss.detach().cpu()),
+            "trajectory_rot_noise_l1": float(trajectory_rot_loss.detach().cpu()),
+            "keyframe_tcp_noise_l1": float(keyframe_tcp_loss.detach().cpu()),
+            "keyframe_tcp_pos_noise_l1": float(keyframe_tcp_pos_loss.detach().cpu()),
+            "keyframe_tcp_rot_noise_l1": float(keyframe_tcp_rot_loss.detach().cpu()),
+            "keyframe_node_position_l1": float(keyframe_node_position_loss.detach().cpu()),
+            "gripper_l1": float(gripper_loss.detach().cpu()),
         }

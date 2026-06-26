@@ -57,17 +57,12 @@ def _quat_wxyz_to_axis_angle(quat: np.ndarray) -> np.ndarray:
     return (axis * angle * sign).astype(np.float32)
 
 
-def _quat_wxyz_to_rot6d(quat: np.ndarray) -> np.ndarray:
-    """Convert a single WXYZ quaternion to 6D rotation."""
-    quat = quat / max(np.linalg.norm(quat), 1e-8)
-    w, x, y, z = quat[0], quat[1], quat[2], quat[3]
-    r00 = 1.0 - 2.0 * (y * y + z * z)
-    r10 = 2.0 * (x * y + z * w)
-    r20 = 2.0 * (x * z - y * w)
-    r01 = 2.0 * (x * y - z * w)
-    r11 = 1.0 - 2.0 * (x * x + z * z)
-    r21 = 2.0 * (y * z + x * w)
-    return np.array([r00, r10, r20, r01, r11, r21], dtype=np.float32)
+def _canonicalize_quat(quat: np.ndarray, eps: float = 1e-8) -> np.ndarray:
+    quat = np.asarray(quat, dtype=np.float32)
+    quat = quat / np.linalg.norm(quat, keepdims=True).clip(min=eps)
+    if quat[0] < 0.0:
+        quat = -quat
+    return quat.astype(np.float32)
 
 
 def _get_pose(actor) -> np.ndarray:
@@ -81,23 +76,23 @@ def _get_pose(actor) -> np.ndarray:
 
 
 def _get_map4d_stackcube(env) -> np.ndarray:
-    """Get 9-dim map4d (pos+rot6d) for StackCube. Shape (3, 9)."""
+    """Get 7-dim map4d (pos+quat_wxyz) for StackCube."""
     cube_a_pose = _get_pose(env.cubeA)
     cube_b_pose = _get_pose(env.cubeB)
     table_pose = _get_pose(env.table_scene.table)
     poses = [cube_a_pose, cube_b_pose, table_pose]
     positions = np.stack([p[:3] for p in poses], axis=0)
-    rotations = np.stack([_quat_wxyz_to_rot6d(p[3:7]) for p in poses], axis=0)
+    rotations = np.stack([_canonicalize_quat(p[3:7]) for p in poses], axis=0)
     return np.concatenate([positions, rotations], axis=-1).astype(np.float32)
 
 
 def _get_map4d_plugcharger(env) -> np.ndarray:
-    """Get 9-dim map4d (pos+rot6d) for PlugCharger. Shape (2, 9)."""
+    """Get 7-dim map4d (pos+quat_wxyz) for PlugCharger."""
     charger_pose = _get_pose(env.charger)
     receptacle_pose = _get_pose(env.receptacle)
     poses = [charger_pose, receptacle_pose]
     positions = np.stack([p[:3] for p in poses], axis=0)
-    rotations = np.stack([_quat_wxyz_to_rot6d(p[3:7]) for p in poses], axis=0)
+    rotations = np.stack([_canonicalize_quat(p[3:7]) for p in poses], axis=0)
     return np.concatenate([positions, rotations], axis=-1).astype(np.float32)
 
 
@@ -258,8 +253,11 @@ def evaluate_maniskill(
                 "robot_state": torch.from_numpy(
                     np.stack(obs_batch["robot_state"])
                 ).float().unsqueeze(1).expand(-1, n_obs_steps, -1).to(device),
-                "node_poses": torch.from_numpy(
-                    np.stack(obs_batch["map4d"])
+                "node_position": torch.from_numpy(
+                    np.stack(obs_batch["map4d"])[..., 0:3]
+                ).float().to(device),
+                "node_rotation": torch.from_numpy(
+                    np.stack(obs_batch["map4d"])[..., 3:7]
                 ).float().to(device),
                 "size_parameters": torch.from_numpy(
                     np.tile(size_params, (num_eval_envs, 1))

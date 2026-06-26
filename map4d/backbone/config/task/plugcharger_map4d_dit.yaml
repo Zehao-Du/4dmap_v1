@@ -1,6 +1,7 @@
 name: PlugCharger-v1
 dataset_task_name: plugcharger
 robot_state_dim: 32
+trajectory_dim: 7
 keyframe_tcp_dim: 7
 eval_control_mode: pd_ee_delta_pose
 eval_max_episode_steps: 500
@@ -20,6 +21,7 @@ dataset:
   map4d_dim: ${map4d_dim}
   size_parameter_dim: ${size_parameter_dim}
   relation_parameter_dim: ${relation_parameter_dim}
+  action_type: single_arm_ee_pose
   use_rgb: ${policy.model_cfg.use_rgb}
   use_depth: false
   rgb_feature_dim: ${policy.model_cfg.rgb_feature_dim}

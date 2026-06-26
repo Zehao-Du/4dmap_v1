@@ -121,6 +121,31 @@ def _require_clean_group(parent: h5py.Group, name: str, overwrite: bool) -> h5py
     return parent.require_group(name)
 
 
+def _has_complete_pointcloud(traj: h5py.Group, cameras: Sequence[str], num_points: int) -> bool:
+    try:
+        obs = traj["obs"]
+        pointcloud_group = obs["point_cloud"]
+        source_group = obs["point_cloud_source"]
+        fused = pointcloud_group["fused"]
+        if fused.ndim != 3 or fused.shape[1:] != (num_points, 6):
+            return False
+        for camera in cameras:
+            if camera not in pointcloud_group or pointcloud_group[camera].shape[0] != fused.shape[0]:
+                return False
+            camera_source = source_group[camera]
+            if "camera_index" not in camera_source or "pixel_uv" not in camera_source:
+                return False
+        fused_source = source_group["fused"]
+        if fused_source["camera_index"].shape != fused.shape[:2]:
+            return False
+        if fused_source["pixel_uv"].shape != fused.shape[:2] + (2,):
+            return False
+        tcp_group = obs["tcp_trajectory"]
+        return tcp_group["pose"].shape[0] == fused.shape[0] and tcp_group["pos"].shape == (fused.shape[0], 3)
+    except Exception:
+        return False
+
+
 def _depth_to_meters(depth: np.ndarray) -> np.ndarray:
     depth = np.asarray(depth)
     if depth.ndim == 3 and depth.shape[-1] == 1:
@@ -165,26 +190,24 @@ def _sample_points(
     bbox_min: np.ndarray,
     bbox_max: np.ndarray,
     rng: np.random.Generator,
-) -> Tuple[np.ndarray, np.ndarray, bool]:
+) -> Tuple[np.ndarray, np.ndarray]:
     xyz = xyzrgb[:, :3]
     valid = np.isfinite(xyz).all(axis=1)
     valid &= xyz[:, 2] > bbox_min[2]
     inside = valid & np.all((xyz >= bbox_min) & (xyz <= bbox_max), axis=1)
     candidate_indices = np.flatnonzero(inside)
-    used_fallback = False
-
     if len(candidate_indices) == 0:
-        candidate_indices = np.flatnonzero(valid)
-        used_fallback = True
-    if len(candidate_indices) == 0:
-        raise ValueError("No valid depth points available for point cloud sampling.")
+        raise ValueError("No valid depth points inside workspace bbox for point cloud sampling.")
+    if len(candidate_indices) < num_points:
+        raise ValueError(
+            f"Only {len(candidate_indices)} valid depth points inside workspace bbox; "
+            f"need {num_points}. Refusing to sample with replacement."
+        )
 
-    replace = len(candidate_indices) < num_points
-    sampled_indices = rng.choice(candidate_indices, size=num_points, replace=replace)
+    sampled_indices = rng.choice(candidate_indices, size=num_points, replace=False)
     return (
         xyzrgb[sampled_indices].astype(np.float32),
         pixel_uv[sampled_indices].astype(np.int32),
-        used_fallback or replace,
     )
 
 
@@ -215,7 +238,6 @@ def _build_traj_pointcloud(
     fused_frames: List[np.ndarray] = []
     fused_pixel_frames: List[np.ndarray] = []
     fused_camera_index_frames: List[np.ndarray] = []
-    fallback_counts = {camera: 0 for camera in cameras}
 
     num_frames = traj["obs"]["sensor_data"][cameras[0]]["rgb"].shape[0]
     for frame_idx in range(num_frames):
@@ -238,7 +260,7 @@ def _build_traj_pointcloud(
             xyzrgb = np.concatenate([xyz, rgb_flat], axis=1)
 
             rng = np.random.default_rng(seed + frame_idx * 9973 + camera_idx * 101)
-            sampled, sampled_pixel_uv, fallback = _sample_points(
+            sampled, sampled_pixel_uv = _sample_points(
                 xyzrgb,
                 pixel_uv,
                 camera_points,
@@ -246,8 +268,6 @@ def _build_traj_pointcloud(
                 bbox_max,
                 rng,
             )
-            if fallback:
-                fallback_counts[camera] += 1
             per_camera_clouds[camera].append(sampled)
             per_camera_pixels[camera].append(sampled_pixel_uv)
             per_camera_indices[camera].append(
@@ -276,7 +296,7 @@ def _build_traj_pointcloud(
         "pixel_uv": np.stack(fused_pixel_frames, axis=0).astype(np.int32),
         "camera_index": np.stack(fused_camera_index_frames, axis=0).astype(np.int16),
     }
-    return per_camera_arrays, fused, per_camera_sources, fused_source, fallback_counts
+    return per_camera_arrays, fused, per_camera_sources, fused_source
 
 
 def build_pointcloud_dataset(
@@ -291,7 +311,10 @@ def build_pointcloud_dataset(
     overwrite: bool,
     in_place: bool,
     seed: int,
+    skip_existing: bool,
 ) -> Dict[str, object]:
+    if skip_existing:
+        raise ValueError("--skip-existing is disabled for Map4D data generation; rebuild and validate explicitly.")
     if output_path.exists() and not overwrite and not in_place:
         raise FileExistsError(f"{output_path} exists. Pass --overwrite to replace it.")
 
@@ -323,7 +346,32 @@ def build_pointcloud_dataset(
                 traj_in = f_in[traj_name]
                 traj_out = f_out[traj_name]
                 camera_names = _discover_cameras(traj_in, cameras)
-                per_camera, fused, per_camera_sources, fused_source, fallback_counts = _build_traj_pointcloud(
+                if skip_existing and _has_complete_pointcloud(traj_out, camera_names, num_points):
+                    fused = traj_out["obs"]["point_cloud"]["fused"]
+                    tcp_pose = traj_out["obs"]["tcp_trajectory"]["pose"]
+                    summary_rows.append(
+                        {
+                            "traj": traj_name,
+                            "num_frames": int(fused.shape[0]),
+                            "cameras": camera_names,
+                            "per_camera_shapes": {
+                                camera: list(traj_out["obs"]["point_cloud"][camera].shape)
+                                for camera in camera_names
+                            },
+                            "fused_shape": list(fused.shape),
+                            "fused_camera_index_shape": list(
+                                traj_out["obs"]["point_cloud_source"]["fused"]["camera_index"].shape
+                            ),
+                            "fused_pixel_uv_shape": list(
+                                traj_out["obs"]["point_cloud_source"]["fused"]["pixel_uv"].shape
+                            ),
+                            "tcp_pose_shape": list(tcp_pose.shape),
+                            "skipped_existing": True,
+                        }
+                    )
+                    print(f"{traj_name}: existing point_cloud found; skipping", flush=True)
+                    continue
+                per_camera, fused, per_camera_sources, fused_source = _build_traj_pointcloud(
                     traj_in,
                     camera_names,
                     num_points,
@@ -381,7 +429,6 @@ def build_pointcloud_dataset(
                         "fused_camera_index_shape": list(fused_source["camera_index"].shape),
                         "fused_pixel_uv_shape": list(fused_source["pixel_uv"].shape),
                         "tcp_pose_shape": list(tcp_pose.shape),
-                        "fallback_counts": fallback_counts,
                     }
                 )
                 print(
@@ -422,6 +469,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--in-place", action="store_true")
+    parser.add_argument(
+        "--skip-existing",
+        action="store_true",
+        help="Skip trajectories that already contain complete point_cloud/source/tcp_trajectory fields.",
+    )
     return parser.parse_args()
 
 
@@ -451,6 +503,7 @@ def main() -> None:
         overwrite=args.overwrite,
         in_place=args.in_place,
         seed=args.seed,
+        skip_existing=args.skip_existing,
     )
 
     summary_path = (

@@ -1,4 +1,5 @@
 from typing import Union, Dict
+import copy
 
 import unittest
 import zarr
@@ -7,6 +8,40 @@ import torch
 import torch.nn as nn
 from map4d.backbone.common.pytorch_util import dict_apply
 from map4d.backbone.model.common.dict_of_tensor_mixin import DictOfTensorMixin
+
+
+# TODO(normalization-audit): Check PPI and Map4D normalization parity.
+# - PPI stats generation uses mode="limits" for action, agent_pos, point_cloud,
+#   dino_feature, lang, point_flow, and initial_point_flow.
+# - PPI policy normalizes batch["obs"] as a dict, then normalizes action and
+#   point_flow separately.
+# - Map4D stats generation should use mode="limits" for every normalized field.
+# - Map4D policy normalizes batch["obs"] as a dict; every possible obs key
+#   returned by the dataset must have a matching normalizer entry.
+# - Audit whether Map4D point_cloud, dino_feature, and rgb_feature should be
+#   fitted in get_normalizer() when those keys are enabled in obs.
+# - Audit target-field normalization names: trajectory_pos, gripper_openness,
+#   keyframe_map4d_pos, keyframe_tcp_pos, and keyframe_tcp_gripper.
+'''
+ppi normalization
+  action              -> 16 dims: left xyz, left quat, right xyz, right quat, left openess, right openess
+  agent_pos (robot state) -> 16 dims: left xyz, left quat, right xyz, right quat, left openess, right openess
+  point_cloud         -> 6 dims: xyz + rgb
+  dino_feature        -> 384 dims: DINO channels
+  lang                -> lang_dim dims: language embedding channels
+  point_flow          -> 3 dims: xyz flow
+  initial_point_flow  -> 3 dims: xyz flow
+  
+DiTmap4d normalization:
+  action                -> 8 dims: left xyz, left quat, left openess
+  robot state           -> 8 dims: left xyz, left quat, left openess
+  4dmap_feature         -> map_dims: 4dmap embedding channels  (LayerNorm, not in this python file)
+  point_cloud           -> 6 dims: xyz + rgb
+  node_position         -> 3 dim: xyz, uses point_cloud xyz stats for graph space
+  node_rotation         -> 4 dims: quaternion_wxyz, identity normalizer / canonicalization only
+  dino_feature          -> 384 dims: DINO channels
+  (optional) lang       -> lang_dim dims: language embedding channels
+'''
 
 
 class LinearNormalizer(DictOfTensorMixin):
@@ -55,6 +90,9 @@ class LinearNormalizer(DictOfTensorMixin):
         if isinstance(x, dict):
             result = dict()
             for key, value in x.items():
+                if key not in self.params_dict and torch.is_tensor(value) and value.numel() == 0:
+                    result[key] = value
+                    continue
                 params = self.params_dict[key]
                 result[key] = _normalize(value, params, forward=forward)
             return result
@@ -69,6 +107,18 @@ class LinearNormalizer(DictOfTensorMixin):
 
     def unnormalize(self, x: Union[Dict, torch.Tensor, np.ndarray]) -> torch.Tensor:
         return self._normalize_impl(x, forward=False)
+
+    def normalize_map4d_graph_data(
+            self,
+            data,
+            point_cloud_key: str = "point_cloud",
+            inplace: bool = False):
+        return normalize_map4d_graph_data(
+            data,
+            self,
+            point_cloud_key=point_cloud_key,
+            inplace=inplace,
+        )
 
     def get_input_stats(self) -> Dict:
         if len(self.params_dict) == 0:
@@ -276,6 +326,87 @@ def _normalize(x, params, forward=True):
         x = (x - offset) / scale
     x = x.reshape(src_shape)
     return x
+
+
+def _point_cloud_xyz_params(normalizer: LinearNormalizer, point_cloud_key: str = "point_cloud"):
+    if point_cloud_key not in normalizer.params_dict:
+        raise KeyError(
+            f"LinearNormalizer is missing {point_cloud_key!r}; "
+            "Map4D graph normalization must use point_cloud xyz stats."
+        )
+    params = normalizer.params_dict[point_cloud_key]
+    scale = params["scale"]
+    offset = params["offset"]
+    if scale.numel() < 3 or offset.numel() < 3:
+        raise ValueError(
+            f"{point_cloud_key!r} normalizer must contain at least xyz channels, "
+            f"got scale shape {tuple(scale.shape)} and offset shape {tuple(offset.shape)}."
+        )
+    return scale[:3], offset[:3]
+
+
+def _normalize_absolute_xyz(value: torch.Tensor, scale: torch.Tensor, offset: torch.Tensor) -> torch.Tensor:
+    scale = scale.to(device=value.device, dtype=value.dtype)
+    offset = offset.to(device=value.device, dtype=value.dtype)
+    return value * scale + offset
+
+
+def _normalize_delta_xyz(value: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    scale = scale.to(device=value.device, dtype=value.dtype)
+    return value * scale
+
+
+def normalize_map4d_graph_data(
+        data,
+        normalizer: LinearNormalizer,
+        point_cloud_key: str = "point_cloud",
+        inplace: bool = False):
+    """Normalize Map4D graph coordinates with the point-cloud xyz normalizer.
+
+    Map4D representation is constructed in real metric space. Before feeding
+    graph data to the map encoder, every absolute xyz coordinate must be moved
+    into the same normalized coordinate system as obs.point_cloud[..., :3].
+
+    This function intentionally does not normalize rotations, semantic features,
+    category/index tensors, or anchor direction vectors. Relative xyz deltas use
+    only the point-cloud scale, because affine offsets cancel in differences.
+    """
+    scale, offset = _point_cloud_xyz_params(normalizer, point_cloud_key=point_cloud_key)
+    out = data if inplace else copy.copy(data)
+
+    if hasattr(out, "node_pos") and out.node_pos is not None:
+        out.node_pos = _normalize_absolute_xyz(out.node_pos, scale, offset)
+
+    if hasattr(out, "x_pos") and out.x_pos is not None and out.x_pos.numel() > 0:
+        out.x_pos = _normalize_absolute_xyz(out.x_pos, scale, offset)
+
+    if hasattr(out, "x_aff") and out.x_aff is not None and out.x_aff.numel() > 0:
+        out.x_aff = _normalize_absolute_xyz(out.x_aff, scale, offset)
+
+    if hasattr(out, "edge_pose") and out.edge_pose is not None and out.edge_pose.numel() > 0:
+        if out.edge_pose.shape[-1] < 3:
+            raise ValueError(f"Map4D edge_pose must have at least 3 xyz dims, got {tuple(out.edge_pose.shape)}")
+        edge_pose = out.edge_pose.clone()
+        edge_pose[..., 0:3] = _normalize_delta_xyz(edge_pose[..., 0:3], scale)
+        out.edge_pose = edge_pose
+
+    if hasattr(out, "edge_anchor") and out.edge_anchor is not None and out.edge_anchor.numel() > 0:
+        if out.edge_anchor.shape[-1] % 12 != 0:
+            raise ValueError(
+                "Map4D edge_anchor is expected to be packed as "
+                "[p(3), primary(3), tangent(3), bitangent(3)] per anchor; "
+                f"got last dim {out.edge_anchor.shape[-1]}."
+            )
+        edge_anchor = out.edge_anchor.clone()
+        for start in range(0, edge_anchor.shape[-1], 12):
+            edge_anchor[..., start:start + 3] = _normalize_absolute_xyz(
+                edge_anchor[..., start:start + 3],
+                scale,
+                offset,
+            )
+        out.edge_anchor = edge_anchor
+
+    return out
 
 
 def test():

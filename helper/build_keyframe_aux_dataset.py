@@ -50,11 +50,6 @@ except ModuleNotFoundError:
     )
 
 
-TASK_ACTOR_NAMES = {
-    "StackCube-v1": ("cubeA", "cubeB", "table-workspace"),
-    "PlugCharger-v1": ("charger", "receptacle"),
-}
-
 @dataclass(frozen=True)
 class StructuralParameters:
     size_parameters: np.ndarray
@@ -67,7 +62,7 @@ def _traj_sort_key(name: str) -> int:
 
 
 def _infer_task_name(path: str) -> str:
-    for task_name in sorted(set(TASK_ACTOR_NAMES) | set(TASK_METADATA_FILES)):
+    for task_name in sorted(TASK_METADATA_FILES):
         if task_name in path:
             return task_name
     raise ValueError(
@@ -76,15 +71,10 @@ def _infer_task_name(path: str) -> str:
 
 
 def _default_actor_names(task_name: str) -> Tuple[str, ...]:
-    try:
-        actor_names = get_task_actor_names(task_name)
-        if actor_names:
-            return actor_names
-    except KeyError:
-        pass
-    if task_name not in TASK_ACTOR_NAMES:
-        raise ValueError(f"No default actor names for task {task_name}")
-    return TASK_ACTOR_NAMES[task_name]
+    actor_names = get_task_actor_names(task_name)
+    if not actor_names:
+        raise ValueError(f"{task_name}: representation JSON must define actor_names")
+    return actor_names
 
 
 def _parse_actor_names(value: Optional[str], task_name: str) -> Tuple[str, ...]:
@@ -93,23 +83,20 @@ def _parse_actor_names(value: Optional[str], task_name: str) -> Tuple[str, ...]:
     return _default_actor_names(task_name)
 
 
-def _quat_wxyz_to_rotation_6d_np(quat_wxyz: np.ndarray) -> np.ndarray:
+def _representation_json_path(task_name: str) -> str:
+    filename = TASK_METADATA_FILES.get(task_name)
+    if filename is None:
+        raise KeyError(f"No Map4D representation JSON registered for task {task_name!r}")
+    return f"map4d/representation/maps4d/{filename}"
+
+
+def _canonicalize_quaternion_np(quat_wxyz: np.ndarray) -> np.ndarray:
     quat = np.asarray(quat_wxyz, dtype=np.float32)
     if quat.ndim != 2 or quat.shape[1] != 4:
         raise ValueError(f"Expected quaternion shape [T, 4], got {quat.shape}")
     quat = quat / np.linalg.norm(quat, axis=1, keepdims=True).clip(min=1e-8)
-    w, x, y, z = quat[:, 0], quat[:, 1], quat[:, 2], quat[:, 3]
-    matrix = np.empty((quat.shape[0], 3, 3), dtype=np.float32)
-    matrix[:, 0, 0] = 1.0 - 2.0 * (y * y + z * z)
-    matrix[:, 0, 1] = 2.0 * (x * y - z * w)
-    matrix[:, 0, 2] = 2.0 * (x * z + y * w)
-    matrix[:, 1, 0] = 2.0 * (x * y + z * w)
-    matrix[:, 1, 1] = 1.0 - 2.0 * (x * x + z * z)
-    matrix[:, 1, 2] = 2.0 * (y * z - x * w)
-    matrix[:, 2, 0] = 2.0 * (x * z - y * w)
-    matrix[:, 2, 1] = 2.0 * (y * z + x * w)
-    matrix[:, 2, 2] = 1.0 - 2.0 * (x * x + y * y)
-    return np.concatenate([matrix[:, :, 0], matrix[:, :, 1]], axis=1).astype(np.float32)
+    sign = np.where(quat[:, 0:1] < 0.0, -1.0, 1.0).astype(np.float32)
+    return (quat * sign).astype(np.float32)
 
 
 def _actor_states_to_map4d_tensor(
@@ -125,13 +112,10 @@ def _actor_states_to_map4d_tensor(
     if sizes is not None:
         sizes_np = np.asarray(tuple(sizes), dtype=np.float32).reshape(num_objects, 3)
     else:
-        sizes_np = np.zeros((num_objects, 3), dtype=np.float32)
+        raise ValueError("sizes must be provided when building legacy [size, position, rotation] map4d tensors")
     sizes_seq = np.broadcast_to(sizes_np, (frame_count, num_objects, 3))
     positions = np.stack([state[:, 0:3] for state in states], axis=1)
-    rotations = np.stack(
-        [_quat_wxyz_to_rotation_6d_np(state[:, 3:7]) for state in states],
-        axis=1,
-    )
+    rotations = np.stack([_canonicalize_quaternion_np(state[:, 3:7]) for state in states], axis=1)
     return np.concatenate([sizes_seq, positions, rotations], axis=-1).astype(np.float32)
 
 
@@ -141,10 +125,7 @@ def _actor_states_to_pose_map4d_tensor(actor_states: Sequence[np.ndarray]) -> np
     if any(state.shape[0] != frame_count for state in states):
         raise ValueError("All actor state arrays must have the same frame count.")
     positions = np.stack([state[:, 0:3] for state in states], axis=1)
-    rotations = np.stack(
-        [_quat_wxyz_to_rotation_6d_np(state[:, 3:7]) for state in states],
-        axis=1,
-    )
+    rotations = np.stack([_canonicalize_quaternion_np(state[:, 3:7]) for state in states], axis=1)
     return np.concatenate([positions, rotations], axis=-1).astype(np.float32)
 
 
@@ -226,16 +207,7 @@ def _env_attr(env: object, name: str) -> object:
 def _stackcube_structural_parameters(env: object) -> StructuralParameters:
     cube_half_size = _as_float_vector(_env_attr(env, "cube_half_size"), name="cube_half_size", length=3)
     cube_size = cube_half_size * 2.0
-    table_scene = _env_attr(env, "table_scene")
-    table_size = np.asarray(
-        [
-            float(_env_attr(table_scene, "table_length")),
-            float(_env_attr(table_scene, "table_width")),
-            float(_env_attr(table_scene, "table_height")),
-        ],
-        dtype=np.float32,
-    )
-    actor_sizes = np.stack([cube_size, cube_size, table_size], axis=0).astype(np.float32)
+    actor_sizes = np.stack([cube_size, cube_size], axis=0).astype(np.float32)
     return StructuralParameters(
         size_parameters=actor_sizes.reshape(-1).astype(np.float32),
         relation_parameters=np.zeros((0,), dtype=np.float32),
@@ -373,7 +345,10 @@ def _load_gripper_target(traj: h5py.Group, length: int) -> np.ndarray:
         if qpos_arr.ndim == 2 and qpos_arr.shape[0] == length and qpos_arr.shape[1] >= 2:
             return qpos_arr[:, -2:].mean(axis=1, keepdims=True).astype(np.float32)
 
-    return np.zeros((length, 1), dtype=np.float32)
+    raise KeyError(
+        f"{traj.name}: cannot load gripper target from actions or obs/agent/qpos; "
+        "refusing to write zero gripper fallback"
+    )
 
 
 def build_keyframe_aux_dataset(
@@ -425,24 +400,24 @@ def build_keyframe_aux_dataset(
             f_out.attrs["source_demo_path"] = demo_path
             f_out.attrs["source_metadata_path"] = str(_demo_metadata_path(demo_path))
             f_out.attrs["task_name"] = task_name
-            f_out.attrs["actor_names"] = json.dumps(list(actor_names))
+            f_out.attrs["representation_json"] = _representation_json_path(task_name)
             f_out.attrs["future_horizon"] = int(future_horizon)
             f_out.attrs["structural_parameter_source"] = "maniskill_env"
             if tcp_target not in {"pose", "pos", "pos_gripper"}:
                 raise ValueError(f"tcp_target must be 'pose', 'pos', or 'pos_gripper', got {tcp_target!r}")
             if target_format is None:
                 if tcp_target == "pose":
-                    target_format = "object_delta_pos_rot6d_plus_tcp_pose"
+                    target_format = MAP4D_DIT_TARGET_FORMAT
                 elif tcp_target == "pos":
-                    target_format = "object_delta_pos_rot6d_plus_tcp_pos"
+                    target_format = "object_delta_pos_quat_plus_tcp_pos"
                 else:
-                    target_format = "object_delta_pos_rot6d_plus_tcp_pos_gripper"
+                    target_format = MAP4D_DIT_TCP_POS_GRIPPER_TARGET_FORMAT
             if target_format not in {
                 MAP4D_DIT_TARGET_FORMAT,
                 MAP4D_DIT_TCP_POS_GRIPPER_TARGET_FORMAT,
-                "object_delta_pos_rot6d_plus_tcp_pose",
-                "object_delta_pos_rot6d_plus_tcp_pos",
-                "object_delta_pos_rot6d_plus_tcp_pos_gripper",
+                "object_delta_pos_quat_plus_tcp_pose",
+                "object_delta_pos_quat_plus_tcp_pos",
+                "object_delta_pos_quat_plus_tcp_pos_gripper",
             }:
                 raise ValueError(f"Unsupported target_format={target_format!r}")
             if target_format == MAP4D_DIT_TARGET_FORMAT and tcp_target != "pose":
@@ -474,16 +449,22 @@ def build_keyframe_aux_dataset(
                         f"({size_parameters.shape[0]}, {relation_parameters.shape[0]})"
                     )
 
-                if target_format in {MAP4D_DIT_TARGET_FORMAT, MAP4D_DIT_TCP_POS_GRIPPER_TARGET_FORMAT}:
+                if target_format in {
+                    MAP4D_DIT_TARGET_FORMAT,
+                    MAP4D_DIT_TCP_POS_GRIPPER_TARGET_FORMAT,
+                    "object_delta_pos_quat_plus_tcp_pose",
+                    "object_delta_pos_quat_plus_tcp_pos",
+                    "object_delta_pos_quat_plus_tcp_pos_gripper",
+                }:
                     map4d = _load_pose_map4d_from_traj(traj, actor_names)
-                    group_map4d_dim = 9
+                    group_map4d_dim = 7
                 else:
                     map4d = _load_map4d_from_traj(
                         traj,
                         actor_names,
                         structural_parameters.actor_sizes.reshape(-1),
                     )
-                    group_map4d_dim = 12
+                    group_map4d_dim = 10
                 tcp_pose = traj["obs"]["extra"]["tcp_pose"][()].astype(np.float32)
                 if tcp_pose.shape[0] != map4d.shape[0]:
                     raise ValueError(
@@ -531,13 +512,23 @@ def build_keyframe_aux_dataset(
                 _write_dataset(group, "future_keyframe_indices", future_table)
 
                 if materialize_targets:
-                    if target_format == MAP4D_DIT_TARGET_FORMAT:
+                    if target_format in {MAP4D_DIT_TARGET_FORMAT, "object_delta_pos_quat_plus_tcp_pose"}:
                         object_targets, tcp_targets = gather_map4d_dit_keyframe_targets(
                             map4d,
                             tcp_pose,
                             future_table,
                         )
-                    elif target_format == MAP4D_DIT_TCP_POS_GRIPPER_TARGET_FORMAT:
+                    elif target_format == "object_delta_pos_quat_plus_tcp_pos":
+                        object_targets, tcp_targets = gather_map4d_dit_keyframe_targets(
+                            map4d,
+                            tcp_pose,
+                            future_table,
+                        )
+                        tcp_targets = tcp_targets[..., :3]
+                    elif target_format in {
+                        MAP4D_DIT_TCP_POS_GRIPPER_TARGET_FORMAT,
+                        "object_delta_pos_quat_plus_tcp_pos_gripper",
+                    }:
                         object_targets, tcp_targets = gather_map4d_dit_pos_gripper_keyframe_targets(
                             map4d,
                             tcp_pose,
@@ -578,7 +569,7 @@ def build_keyframe_aux_dataset(
         "tcp_target": tcp_target,
         "target_format": target_format,
         "tcp_dim": 7 if tcp_target == "pose" else 4 if tcp_target == "pos_gripper" else 3,
-        "map4d_dim": 9
+            "map4d_dim": 7
         if target_format in {MAP4D_DIT_TARGET_FORMAT, MAP4D_DIT_TCP_POS_GRIPPER_TARGET_FORMAT}
         else 12,
         "size_parameter_dim": int(size_parameter_dim or 0),
@@ -620,9 +611,9 @@ def parse_args() -> argparse.Namespace:
         choices=[
             MAP4D_DIT_TARGET_FORMAT,
             MAP4D_DIT_TCP_POS_GRIPPER_TARGET_FORMAT,
-            "object_delta_pos_rot6d_plus_tcp_pose",
-            "object_delta_pos_rot6d_plus_tcp_pos",
-            "object_delta_pos_rot6d_plus_tcp_pos_gripper",
+            "object_delta_pos_quat_plus_tcp_pose",
+            "object_delta_pos_quat_plus_tcp_pos",
+            "object_delta_pos_quat_plus_tcp_pos_gripper",
         ],
         help=(
             "Materialized keyframe target convention. Defaults to the legacy "

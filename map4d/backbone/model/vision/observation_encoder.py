@@ -59,18 +59,30 @@ class ObservationEncoder(nn.Module):
                  pointcloud_encoder_cfg=None,
                  use_lang=False,
                  scene_pcd_num=6144,
+                 state_key='agent_pos',
+                 point_cloud_key='point_cloud',
+                 lang_key='lang',
                  ):
         super().__init__()
         self.scene_pcd_num = scene_pcd_num
-        self.state_key = 'agent_pos'
-        self.point_cloud_key = 'point_cloud'
-        self.lang_key = 'lang'
+        self.state_key = state_key
+        self.point_cloud_key = point_cloud_key
+        self.lang_key = lang_key
+        self.use_lang = use_lang
         self.out_channel = out_channel
         self.dim_dino_feature = dim_dino_feature
         
         self.state_shape = state_shape   # 16 when dual arm ee pose, 8 when single arm ee pose
         self.lang_shape = 1024  
         self.pcd_mlp_size = pcd_mlp_size
+        if pointcloud_encoder_cfg is None:
+            pointcloud_encoder_cfg = {
+                "in_channels": 3 + self.dim_dino_feature,
+                "out_channels": out_channel,
+                "use_bn": True,
+                "npoint1": 1024,
+                "npoint2": 512,
+            }
         self.pointnet_encoder = PointNet2DenseEncoder(**pointcloud_encoder_cfg)
         
 
@@ -83,7 +95,7 @@ class ObservationEncoder(nn.Module):
         output_dim = state_mlp_size[-1]
 
         self.state_mlp = nn.Sequential(*create_mlp(self.state_shape, output_dim, net_arch, state_mlp_activation_fn))
-        self.pcd_mlp = nn.Sequential(*create_mlp(384, pcd_mlp_size[-1], pcd_mlp_size[:-1], pcd_mlp_activation_fn))
+        self.pcd_mlp = nn.Sequential(*create_mlp(self.dim_dino_feature, pcd_mlp_size[-1], pcd_mlp_size[:-1], pcd_mlp_activation_fn))
         if use_lang:
             if len(lang_mlp_size) == 0:
                 raise RuntimeError(f"Language mlp size is empty")
@@ -108,10 +120,13 @@ class ObservationEncoder(nn.Module):
         
         state = observations[self.state_key]
         state_feat = self.state_mlp(state)
-        lang = observations[self.lang_key]
-        lang_feat = self.lang_mlp(lang)
+        if self.use_lang:
+            lang = observations[self.lang_key]
+            lang_feat = self.lang_mlp(lang)
+        else:
+            lang_feat = state_feat.new_zeros(state_feat.shape[0], self.out_channel)
         dino_feature = dino_feature.reshape(-1,self.dim_dino_feature)
-        pcd_feat = self.pcd_mlp(dino_feature).reshape(-1,self.scene_pcd_num,self.pcd_mlp_size[-1])
+        pcd_feat = self.pcd_mlp(dino_feature).reshape(points.shape[0], points.shape[1], self.pcd_mlp_size[-1])
         
         return (points, pcd_feat, lang_feat, state_feat, sampled_pcd_coord, sampled_pcd_feat)
 

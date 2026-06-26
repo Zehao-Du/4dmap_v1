@@ -23,7 +23,7 @@ if [[ ! -f "${DEMO_PATH}" ]]; then
 fi
 if [[ ! -f "${KEYFRAME_AUX_PATH}" ]]; then
   echo "Keyframe aux file not found: ${KEYFRAME_AUX_PATH}" >&2
-  echo "Build it with: TASK_NAME=PlugCharger-v1 bash scripts/data_collection/build_keyframe_aux_dataset.sh" >&2
+  echo "Build it with: TASK_NAME=PlugCharger-v1 bash scripts/data_collection/act_dataset/build_keyframe_aux_dataset.sh" >&2
   exit 1
 fi
 
