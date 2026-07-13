@@ -340,7 +340,13 @@ class Map4DDiTPolicy(BasePolicy):
             "trajectory": torch.cat([trajectory_pos, trajectory_tail], dim=-1),
             "keyframe_tcp": torch.cat([tcp_pos, tcp_tail], dim=-1),
         }
-        condition_mask = self.mask_generator(ntrajectory.shape)
+        if ntrajectory.ndim == 4:
+            batch_size, num_arms, horizon, dim = ntrajectory.shape
+            condition_mask = self.mask_generator((batch_size * num_arms, horizon, dim)).reshape(
+                batch_size, num_arms, horizon, dim
+            )
+        else:
+            condition_mask = self.mask_generator(ntrajectory.shape)
         if ntrajectory.shape[-1] == 4:
             condition_mask = condition_mask.clone()
             condition_mask[..., 3:4] = False

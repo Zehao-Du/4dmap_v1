@@ -91,6 +91,10 @@ class TrainMap4DDiTWorkspace:
     def _rank0(self) -> bool:
         return self.global_rank == 0
 
+    def _log(self, message: str) -> None:
+        if self._rank0():
+            print(f"[{time.strftime('%H:%M:%S')}] {message}", flush=True)
+
     def _policy_for_eval(self):
         if self.ema_model is not None:
             return self.ema_model
@@ -105,6 +109,7 @@ class TrainMap4DDiTWorkspace:
             torch.cuda.set_device(device)
         else:
             device = torch.device("cpu")
+        self._log(f"Using device={device}, world_size={self.world_size}")
 
         if cfg.training.debug:
             cfg.training.num_epochs = min(int(cfg.training.num_epochs), 2)
@@ -115,10 +120,14 @@ class TrainMap4DDiTWorkspace:
             cfg.training.sample_every = 1
             cfg.checkpoint.save_ckpt = False
 
+        self._log("Instantiating dataset")
         dataset: BaseDataset = hydra.utils.instantiate(cfg.task.dataset)
         if not isinstance(dataset, BaseDataset):
             raise TypeError(f"dataset must be BaseDataset, got {type(dataset)}")
+        self._log(f"Dataset ready: type={type(dataset).__name__}, train_len={len(dataset)}")
+        self._log("Normalizing dataset")
         normalizer = dataset.get_normalizer()
+        self._log("Normalizer ready")
         self.model.set_normalizer(normalizer)
         if self.ema_model is not None:
             self.ema_model.set_normalizer(normalizer)
@@ -129,6 +138,10 @@ class TrainMap4DDiTWorkspace:
         else:
             train_sampler = None
             shuffle = bool(cfg.dataloader.shuffle)
+        self._log(
+            "Building train dataloader "
+            f"batch_size={int(cfg.dataloader.batch_size)}, num_workers={int(cfg.dataloader.num_workers)}"
+        )
         train_dataloader = DataLoader(
             dataset,
             batch_size=int(cfg.dataloader.batch_size),
@@ -140,11 +153,17 @@ class TrainMap4DDiTWorkspace:
         )
 
         val_dataset = dataset.get_validation_dataset()
+        self._log(f"Validation dataset ready: val_len={len(val_dataset)}")
         val_dataloader = None
         val_sampler = None
         if len(val_dataset) > 0:
             if self.distributed:
                 val_sampler = torch.utils.data.distributed.DistributedSampler(val_dataset, shuffle=False)
+            self._log(
+                "Building validation dataloader "
+                f"batch_size={int(cfg.val_dataloader.batch_size)}, "
+                f"num_workers={int(cfg.val_dataloader.num_workers)}"
+            )
             val_dataloader = DataLoader(
                 val_dataset,
                 batch_size=int(cfg.val_dataloader.batch_size),
@@ -155,9 +174,11 @@ class TrainMap4DDiTWorkspace:
                 sampler=val_sampler,
             )
 
+        self._log("Moving model to device")
         self.model.to(device)
         if self.ema_model is not None:
             self.ema_model.to(device)
+        self._log("Building optimizer and scheduler")
         self.optimizer = hydra.utils.instantiate(cfg.optimizer, params=self.model.parameters())
         optimizer_to(self.optimizer, device)
         self.lr_scheduler = get_scheduler(
@@ -185,6 +206,7 @@ class TrainMap4DDiTWorkspace:
             os.makedirs(self.output_dir, exist_ok=True)
             with open(os.path.join(self.output_dir, "config.yaml"), "w", encoding="utf-8") as f:
                 yaml.safe_dump(OmegaConf.to_container(cfg, resolve=True), f)
+            self._log(f"Output dir: {self.output_dir}")
 
         rollout_evaluator = None
         if self._rank0():
@@ -231,6 +253,7 @@ class TrainMap4DDiTWorkspace:
         train_sampling_batch = None
 
         for local_epoch_idx in range(int(cfg.training.num_epochs)):
+            self._log(f"Starting training epoch {self.epoch}")
             if train_sampler is not None:
                 train_sampler.set_epoch(local_epoch_idx)
             train_losses = []

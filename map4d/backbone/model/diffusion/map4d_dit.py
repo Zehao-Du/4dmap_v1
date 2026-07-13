@@ -24,6 +24,7 @@ if str(MAPS4D_DIR) not in sys.path:
     sys.path.insert(0, str(MAPS4D_DIR))
 from maniskill_plugcharger import Map4d_PlugCharger  # noqa: E402
 from maniskill_stackcube import Map4d_StackCube  # noqa: E402
+from rlbench2_push_box import Map4d_RLBench2PushBox  # noqa: E402
 
 
 def normalize_quaternion(quat: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
@@ -125,6 +126,7 @@ class Map4DDiT(nn.Module):
         cross_attn_layers: int = 2,
         self_attn_layers: Optional[int] = None,
         use_map_node_pos_embed: bool = True,
+        separate_map_cross_attn: bool = False,
     ):
         super().__init__()
         if embed_dim % num_heads != 0:
@@ -164,6 +166,7 @@ class Map4DDiT(nn.Module):
         self.detach_stage_features = bool(detach_stage_features)
         self.use_map_encoder = bool(use_map_encoder)
         self.map_name = map_name
+        self.separate_map_cross_attn = bool(separate_map_cross_attn)
         if self.tcp_dim not in {4, 7}:
             raise ValueError(f"tcp_dim must be 4 or 7, got {self.tcp_dim}")
         if self.point_dim != 3:
@@ -248,6 +251,19 @@ class Map4DDiT(nn.Module):
         self.rgb_proj = None
 
         self_attn_layers = int(self_attn_layers or depth)
+        self.node_map_attn = None
+        self.tcp_map_attn = None
+        self.action_map_attn = None
+        if self.separate_map_cross_attn:
+            self.node_map_attn = FFWRelativeCrossAttentionModule(
+                embed_dim, num_heads, num_layers=int(cross_attn_layers), use_adaln=True
+            )
+            self.tcp_map_attn = FFWRelativeCrossAttentionModule(
+                embed_dim, num_heads, num_layers=int(cross_attn_layers), use_adaln=True
+            )
+            self.action_map_attn = FFWRelativeCrossAttentionModule(
+                embed_dim, num_heads, num_layers=int(cross_attn_layers), use_adaln=True
+            )
         self.node_context_attn = FFWRelativeCrossAttentionModule(
             embed_dim, num_heads, num_layers=int(cross_attn_layers), use_adaln=True
         )
@@ -449,6 +465,8 @@ class Map4DDiT(nn.Module):
             return Map4d_StackCube(positions, rotations, sizes, relations, clip_model=None)
         if self.map_name == "PlugCharger-v1":
             return Map4d_PlugCharger(positions, rotations, sizes, relations, clip_model=None)
+        if self.map_name == "rlbench2_push_box":
+            return Map4d_RLBench2PushBox(positions, rotations, sizes, relations, clip_model=None)
         raise ValueError(f"Unsupported map_name={self.map_name!r}")
 
     def _encoded_map_nodes_from_gt(self, obs: Dict[str, torch.Tensor]) -> torch.Tensor:
@@ -616,11 +634,24 @@ class Map4DDiT(nn.Module):
         sampled_context_token,
         timestep,
         state_feat,
+        semantic_xyz=None,
+        semantic_token=None,
+        map_xyz=None,
+        map_token=None,
     ):
         cond = self.encode_denoising_timestep(timestep, state_feat)
 
+        if self.separate_map_cross_attn:
+            if semantic_xyz is None or semantic_token is None or map_xyz is None or map_token is None:
+                raise ValueError("separate_map_cross_attn requires semantic and map contexts")
+            node_tokens = self._cross_context(self.node_map_attn, node_tokens, node_xyz, map_token, map_xyz, cond)
+            node_context_xyz = semantic_xyz
+            node_context_token = semantic_token
+        else:
+            node_context_xyz = context_xyz
+            node_context_token = context_token
         node_feat = self._cross_context(
-            self.node_context_attn, node_tokens, node_xyz, context_token, context_xyz, cond
+            self.node_context_attn, node_tokens, node_xyz, node_context_token, node_context_xyz, cond
         )
         node_plan = torch.cat([node_feat, sampled_context_token], dim=1)
         node_plan_xyz = torch.cat([node_xyz, sampled_context_xyz], dim=1)
@@ -629,7 +660,14 @@ class Map4DDiT(nn.Module):
 
         node_condition = node_plan.detach() if self.detach_stage_features else node_plan
         node_condition_xyz = node_plan_xyz.detach() if self.detach_stage_features else node_plan_xyz
-        tcp_feat = self._cross_context(self.tcp_context_attn, tcp_tokens, tcp_xyz, context_token, context_xyz, cond)
+        if self.separate_map_cross_attn:
+            tcp_tokens = self._cross_context(self.tcp_map_attn, tcp_tokens, tcp_xyz, map_token, map_xyz, cond)
+            tcp_context_xyz = semantic_xyz
+            tcp_context_token = semantic_token
+        else:
+            tcp_context_xyz = context_xyz
+            tcp_context_token = context_token
+        tcp_feat = self._cross_context(self.tcp_context_attn, tcp_tokens, tcp_xyz, tcp_context_token, tcp_context_xyz, cond)
         tcp_plan = torch.cat([tcp_feat, node_condition], dim=1)
         tcp_plan_xyz = torch.cat([tcp_xyz, node_condition_xyz], dim=1)
         tcp_plan = self._self_attention(self.tcp_self_attn, tcp_plan, tcp_plan_xyz, cond)
@@ -637,8 +675,15 @@ class Map4DDiT(nn.Module):
 
         tcp_condition = tcp_plan.detach() if self.detach_stage_features else tcp_plan
         tcp_condition_xyz = tcp_plan_xyz.detach() if self.detach_stage_features else tcp_plan_xyz
+        if self.separate_map_cross_attn:
+            traj_tokens = self._cross_context(self.action_map_attn, traj_tokens, traj_xyz, map_token, map_xyz, cond)
+            action_context_xyz = semantic_xyz
+            action_context_token = semantic_token
+        else:
+            action_context_xyz = context_xyz
+            action_context_token = context_token
         traj_feat = self._cross_context(
-            self.action_context_attn, traj_tokens, traj_xyz, context_token, context_xyz, cond
+            self.action_context_attn, traj_tokens, traj_xyz, action_context_token, action_context_xyz, cond
         )
         action_plan = torch.cat([traj_feat, tcp_condition], dim=1)
         action_plan_xyz = torch.cat([traj_xyz, tcp_condition_xyz], dim=1)
@@ -691,6 +736,10 @@ class Map4DDiT(nn.Module):
             sampled_context_token=sampled_context_token,
             timestep=timesteps,
             state_feat=state_feat,
+            semantic_xyz=semantic_xyz,
+            semantic_token=semantic_token,
+            map_xyz=map_xyz,
+            map_token=map_token,
         )
         cond = self.encode_denoising_timestep(timesteps, state_feat)
         shift, scale = self.final_modulation(cond).chunk(2, dim=-1)

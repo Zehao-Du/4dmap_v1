@@ -30,6 +30,7 @@ checkpoints/
 
 # core dumps
 core.*
+job
 
 # OS files
 .DS_Store

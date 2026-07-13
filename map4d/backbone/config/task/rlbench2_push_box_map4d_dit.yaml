@@ -1,0 +1,48 @@
+name: rlbench2_push_box
+dataset_task_name: bimanual_push_box
+robot_state_dim: 16
+num_arms: 2
+trajectory_dim: 7
+keyframe_tcp_dim: 7
+eval_control_mode: BimanualJointPositionActionMode
+eval_max_episode_steps: 500
+eval_action_mode: bimanual_joint_position
+
+dataset:
+  _target_: map4d.backbone.dataset.rlbench2_map4d_dataset.RLBench2Map4DDataset
+  data_path: ${oc.env:RLBENCH2_DATA_PATH,${oc.env:MAP4D_RLBENCH2_DATA_PATH,null}}
+  pcd_path: ${oc.env:RLBENCH2_PCD_PATH,${oc.env:MAP4D_RLBENCH2_PCD_PATH,null}}
+  dino_path: ${oc.env:RLBENCH2_DINO_PATH,${oc.env:MAP4D_RLBENCH2_DINO_PATH,null}}
+  lang_emb_path: ${oc.env:RLBENCH2_LANG_EMB_PATH,${oc.env:MAP4D_RLBENCH2_LANG_EMB_PATH,null}}
+  stats_filepath: ${oc.env:RLBENCH2_STATS_FILEPATH,null}
+  point_flow_path: ${oc.env:RLBENCH2_POINT_FLOW_PATH,null}
+  pose_path: ${oc.env:RLBENCH2_POSE_PATH,${oc.env:MAP4D_RLBENCH2_POSE_PATH,null}}
+  task_name: ${task.name}
+  horizon_action: ${horizon_action}
+  horizon_keyframe: ${horizon_keyframe}
+  n_obs_steps: ${n_obs_steps}
+  horizon_continuous: null
+  pad_before: ${eval:'${n_obs_steps}-1'}
+  pad_after: ${eval:'${n_action_steps}-1'}
+  seed: ${seed}
+  start: ${oc.env:RLBENCH2_START,0}
+  end: ${oc.env:RLBENCH2_END,99}
+  pcd_fps: 1024
+  skip_ep: []
+  kp_num: ${oc.env:RLBENCH2_KP_NUM,10}
+  val_ratio: ${oc.env:RLBENCH2_VAL_RATIO,0.05}
+  max_train_episodes: ${oc.env:RLBENCH2_MAX_TRAIN_EPISODES,null}
+  pcd_type: ${oc.env:RLBENCH2_PCD_TYPE,rgb_pcd_rps6144}
+  prediction_type: ${oc.env:RLBENCH2_PREDICTION_TYPE,continuous}
+  point_flow_type: ${oc.env:RLBENCH2_POINT_FLOW_TYPE,rps200}
+  add_openess_sampling: false
+  num_objects: ${num_objects}
+  map4d_dim: ${map4d_dim}
+  size_parameter_dim: ${size_parameter_dim}
+  relation_parameter_dim: ${relation_parameter_dim}
+  robot_state_dim: ${task.robot_state_dim}
+  action_type: bimanual_ee_pose
+  keyframe_tcp_dim: ${task.keyframe_tcp_dim}
+  size_xyz: [0.192, 0.384, 0.128]
+  use_rgb: ${policy.model_cfg.use_rgb}
+  allow_missing_pose: false

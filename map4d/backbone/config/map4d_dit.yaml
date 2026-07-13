@@ -48,11 +48,12 @@ policy:
     relation_parameter_dim: ${relation_parameter_dim}
     trajectory_dim: ${task.trajectory_dim}
     tcp_dim: ${task.keyframe_tcp_dim}
-    rgb_feature_dim: 288
-    semantic_feature_dim: 288
+    rgb_feature_dim: 384
+    semantic_feature_dim: 384
     semantic_feature_mode: precomputed
     map_feature_dim: 240
     n_map_step: ${n_obs_steps}
+    num_arms: ${oc.select:task.num_arms,1}
     num_map_nodes: ${num_map_nodes}
     use_map_encoder: true
     map_name: ${task.name}
@@ -60,7 +61,7 @@ policy:
     map_encoder_num_heads: 8
     use_lang: false
     pointcloud_encoder_cfg:
-      in_channels: 291
+      in_channels: 387
       out_channels: ${policy.model_cfg.embed_dim}
       use_bn: true
       npoint1: 1024
@@ -73,6 +74,7 @@ policy:
     diffusion_step_embed_dim: 240
     use_rgb: true
     max_context_tokens: 20000
+    separate_map_cross_attn: false
 
 ema:
   _target_: map4d.backbone.model.diffusion.ema_model.EMAModel
