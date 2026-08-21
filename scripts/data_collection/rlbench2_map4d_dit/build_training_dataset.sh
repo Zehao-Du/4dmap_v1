@@ -50,6 +50,10 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 POLICY_DIR="${POLICY_DIR:-$(cd "${SCRIPT_DIR}/../../.." && pwd)}"
 ROOT_DIR="${ROOT_DIR:-$(cd "${POLICY_DIR}/.." && pwd)}"
+PROJECT_ROOT="${PROJECT_ROOT:-$(cd "${ROOT_DIR}/.." && pwd)}"
+COPPELIASIM_ROOT="${MAP4D_COPPELIASIM_ROOT:-${PROJECT_ROOT}/codes/CoppeliaSim}"
+RLBENCH_ROOT="${MAP4D_RLBENCH_ROOT:-${PROJECT_ROOT}/codes/rlbench}"
+PYREP_ROOT="${MAP4D_PYREP_ROOT:-${PROJECT_ROOT}/codes/pyrep}"
 
 OVERWRITE_TARGETS="${OVERWRITE_TARGETS:-}"
 while [[ "$#" -gt 0 ]]; do
@@ -126,6 +130,21 @@ if [[ "${#TASKS[@]}" -eq 0 ]]; then
   echo "No RLBench2 tasks configured. Edit TASKS in this script." >&2
   exit 2
 fi
+
+if [[ ! -f "${COPPELIASIM_ROOT}/libcoppeliaSim.so.1" ]]; then
+  echo "CoppeliaSim library not found: ${COPPELIASIM_ROOT}/libcoppeliaSim.so.1" >&2
+  exit 1
+fi
+if [[ ! -d "${RLBENCH_ROOT}/rlbench" ]]; then
+  echo "RLBench Python package not found: ${RLBENCH_ROOT}/rlbench" >&2
+  exit 1
+fi
+if [[ ! -d "${PYREP_ROOT}/pyrep" ]]; then
+  echo "PyRep Python package not found: ${PYREP_ROOT}/pyrep" >&2
+  exit 1
+fi
+export PYTHONPATH="${RLBENCH_ROOT}:${PYREP_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
+export LD_LIBRARY_PATH="${COPPELIASIM_ROOT}:${CONDA_PREFIX}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 
 PCD_TYPE="${RLBENCH2_PCD_TYPE:-rgb_pcd_rps6144}"
 EPISODES="${RLBENCH2_EPISODES:-100}"
@@ -322,12 +341,12 @@ fi
 echo "  pose: ${POSE_INFO}"
 
 if [[ -d "${PCD_PATH}" ]]; then
-  FIRST_PCD="$(find "${PCD_PATH}" -path "*/${PCD_TYPE}/step*.npy" -type f | sort | head -1 || true)"
+  FIRST_PCD="$(find "${PCD_PATH}" -path "*/${PCD_TYPE}/step*.npy" -type f -print -quit)"
 else
   FIRST_PCD=""
 fi
 if [[ -d "${DINO_PATH}" ]]; then
-  FIRST_DINO="$(find "${DINO_PATH}" -path "*/${PCD_TYPE}/step*.npy" -type f | sort | head -1 || true)"
+  FIRST_DINO="$(find "${DINO_PATH}" -path "*/${PCD_TYPE}/step*.npy" -type f -print -quit)"
 else
   FIRST_DINO=""
 fi
@@ -463,6 +482,7 @@ PY
     echo "[$(date +%H:%M:%S)] Running RLBench2Map4DDataset smoke check"
   python - "${RAW_DIR}" "${PCD_PATH}" "${DINO_PATH}" "${LANG_EMB_PATH}" "${POSE_PATH}" "${PCD_TYPE}" "${START_EP}" "${END_EP}" "${PREDICTION_TYPE}" "${SMOKE_USE_RGB}" <<'PY'
 import sys
+import numpy as np
 from map4d.backbone.dataset.rlbench2_map4d_dataset import RLBench2Map4DDataset
 
 raw_dir, pcd_path, dino_path, lang_path, pose_path, pcd_type, start, end, prediction_type, smoke_use_rgb = sys.argv[1:]
@@ -484,7 +504,26 @@ ds = RLBench2Map4DDataset(
     action_type="bimanual_ee_pose",
     use_rgb=smoke_use_rgb == "1",
 )
+raw_state = np.asarray(ds.replay_buffer["state"], dtype=np.float32)
+raw_action = np.asarray(ds.replay_buffer["action"], dtype=np.float32)
+ds._validate_ppi_bimanual_layout(raw_state, field_name="smoke robot_state")
+ds._validate_ppi_bimanual_layout(raw_action, field_name="smoke action")
+
+trajectory = ds.trajectories[0]
+if not np.array_equal(trajectory["robot_state"][0], raw_state[0]):
+    raise AssertionError("Map4D changed PPI robot_state values or ordering")
+formatted_action = trajectory["actions"][0]
+if formatted_action.shape != (2, 8):
+    raise AssertionError(f"Expected Map4D action shape (2,8), got {formatted_action.shape}")
+if not np.allclose(formatted_action[0, 0:3], raw_action[0, 0:3]):
+    raise AssertionError("Map4D left-arm action does not match PPI action[0:3]")
+if not np.allclose(formatted_action[1, 0:3], raw_action[0, 7:10]):
+    raise AssertionError("Map4D right-arm action does not match PPI action[7:10]")
+if not np.allclose(formatted_action[:, 7], raw_action[0, 14:16]):
+    raise AssertionError("Map4D gripper actions do not match PPI action[14:16]")
+
 sample = ds[0]
+print("ppi_layout=left_pose(7),right_pose(7),left_open,right_open verified")
 print(f"smoke_len={len(ds)} trajectories={len(ds.trajectories)}")
 for group_name, group in sample.items():
     if isinstance(group, dict):

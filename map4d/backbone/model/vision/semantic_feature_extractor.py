@@ -1,4 +1,5 @@
-import os
+from pathlib import Path
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -59,7 +60,15 @@ def interpolate_feats(feats, points, h=None, w=None, padding_mode='zeros', align
     return feats_inter
 
 class Fusion():
-    def __init__(self, num_cam, feat_backbone='dinov2', device='cuda:0', dtype=torch.float32):
+    def __init__(
+        self,
+        num_cam,
+        dinov2_repo_path,
+        dinov2_weights_path,
+        feat_backbone='dinov2',
+        device='cuda:0',
+        dtype=torch.float32,
+    ):
         self.device = device
         self.dtype = dtype
         # hyper-parameters
@@ -77,12 +86,21 @@ class Fusion():
         # dino feature extractor
         self.feat_backbone = feat_backbone
         if self.feat_backbone == 'dinov2':
-            # TODO
-            model_path = "pretrained_models/hub/checkpoints/dinov2_vits14_pretrain.pth"
-            repo_path = "repos/dinov2"
-            os.environ["TORCH_HOME"] = "pretrained_models"
-            self.dinov2_feat_extractor = torch.hub.load(repo_path, 'dinov2_vits14',source='local',skip_validation=True)
-            state_dict = torch.load(model_path,map_location=self.device)
+            if dinov2_repo_path is None or dinov2_weights_path is None:
+                raise ValueError(
+                    "dinov2_repo_path and dinov2_weights_path are required for DINOv2 feature extraction"
+                )
+            repo_path = Path(dinov2_repo_path).expanduser()
+            model_path = Path(dinov2_weights_path).expanduser()
+            hubconf_path = repo_path / "hubconf.py"
+            if not hubconf_path.is_file():
+                raise FileNotFoundError(f"DINOv2 repository hubconf.py not found: {hubconf_path}")
+            if not model_path.is_file():
+                raise FileNotFoundError(f"DINOv2 weights not found: {model_path}")
+            self.dinov2_feat_extractor = torch.hub.load(
+                str(repo_path), 'dinov2_vits14', source='local', skip_validation=True
+            )
+            state_dict = torch.load(str(model_path), map_location=self.device)
             self.dinov2_feat_extractor.load_state_dict(state_dict)
             self.dinov2_feat_extractor.to(self.device)
 

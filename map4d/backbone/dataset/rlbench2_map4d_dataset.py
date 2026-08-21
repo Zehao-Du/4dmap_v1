@@ -418,6 +418,11 @@ class RLBench2Map4DDataset(BaseDataset):
 
             robot_state = np.asarray(self.replay_buffer["state"][ep_slice], dtype=np.float32)
             if self.robot_state_dim is not None:
+                if self.action_type == "bimanual_ee_pose" and robot_state.shape[-1] != self.robot_state_dim:
+                    raise ValueError(
+                        "PPI bimanual robot_state dimension mismatch: "
+                        f"data has {robot_state.shape[-1]}, config requires {self.robot_state_dim}"
+                    )
                 robot_state = self._fit_last_dim(robot_state, self.robot_state_dim)
             actions = self._format_actions(np.asarray(self.replay_buffer["action"][ep_slice], dtype=np.float32))
 
@@ -473,13 +478,14 @@ class RLBench2Map4DDataset(BaseDataset):
 
     def _format_actions(self, actions: np.ndarray) -> np.ndarray:
         if self.action_type == "bimanual_ee_pose":
-            if actions.shape[-1] < 16:
-                raise ValueError(f"bimanual_ee_pose expects action dim >=16, got {actions.shape[-1]}")
-            right = actions[:, 0:8].copy()
-            left = actions[:, 8:16].copy()
-            right[:, 3:7] = _xyzw_to_wxyz(right[:, 3:7])
+            if actions.shape[-1] != 16:
+                raise ValueError(f"bimanual_ee_pose expects PPI action dim 16, got {actions.shape[-1]}")
+            self._validate_ppi_bimanual_layout(actions, field_name="action")
+            left = np.concatenate([actions[:, 0:7], actions[:, 14:15]], axis=-1)
+            right = np.concatenate([actions[:, 7:14], actions[:, 15:16]], axis=-1)
             left[:, 3:7] = _xyzw_to_wxyz(left[:, 3:7])
-            return np.stack([right, left], axis=1).astype(np.float32)
+            right[:, 3:7] = _xyzw_to_wxyz(right[:, 3:7])
+            return np.stack([left, right], axis=1).astype(np.float32)
         if actions.shape[-1] >= 8:
             trajectory = actions[:, :7]
             gripper = actions[:, -1:]
@@ -500,13 +506,14 @@ class RLBench2Map4DDataset(BaseDataset):
 
     def _tcp_pose_from_robot_state(self, robot_state: np.ndarray) -> np.ndarray:
         if self.action_type == "bimanual_ee_pose":
-            if robot_state.shape[-1] < 16:
-                raise ValueError(f"bimanual_ee_pose expects robot_state dim >=16, got {robot_state.shape[-1]}")
-            right = robot_state[:, 0:7].copy()
-            left = robot_state[:, 8:15].copy()
-            right[:, 3:7] = _xyzw_to_wxyz(right[:, 3:7])
+            if robot_state.shape[-1] != 16:
+                raise ValueError(f"bimanual_ee_pose expects PPI robot_state dim 16, got {robot_state.shape[-1]}")
+            self._validate_ppi_bimanual_layout(robot_state, field_name="robot_state")
+            left = robot_state[:, 0:7].copy()
+            right = robot_state[:, 7:14].copy()
             left[:, 3:7] = _xyzw_to_wxyz(left[:, 3:7])
-            return np.stack([right, left], axis=1).astype(np.float32)
+            right[:, 3:7] = _xyzw_to_wxyz(right[:, 3:7])
+            return np.stack([left, right], axis=1).astype(np.float32)
         if robot_state.shape[-1] >= 16:
             tcp_pose = robot_state[:, 8:15].copy()
         elif robot_state.shape[-1] >= 7:
@@ -517,6 +524,31 @@ class RLBench2Map4DDataset(BaseDataset):
             return tcp_pose
         tcp_pose[:, 3:7] = canonicalize_quaternion_np(tcp_pose[:, 3:7])
         return tcp_pose.astype(np.float32)
+
+    @staticmethod
+    def _validate_ppi_bimanual_layout(array: np.ndarray, *, field_name: str) -> None:
+        if array.ndim != 2 or array.shape[-1] != 16:
+            raise ValueError(
+                f"{field_name} must have PPI bimanual layout [T,16], got {array.shape}"
+            )
+        if not np.isfinite(array).all():
+            raise ValueError(f"{field_name} contains non-finite values")
+        for arm_name, quat_slice in (("left", slice(3, 7)), ("right", slice(10, 14))):
+            quat_norm = np.linalg.norm(array[:, quat_slice], axis=-1)
+            if not np.allclose(quat_norm, 1.0, atol=1e-3):
+                bad = int(np.flatnonzero(~np.isclose(quat_norm, 1.0, atol=1e-3))[0])
+                raise ValueError(
+                    f"{field_name}[{bad}] {arm_name} XYZW quaternion norm is {quat_norm[bad]}"
+                )
+        openness = array[:, 14:16]
+        invalid = (openness < 0.0) | (openness > 1.0)
+        if invalid.any():
+            row, column = np.argwhere(invalid)[0]
+            arm_name = "left" if column == 0 else "right"
+            raise ValueError(
+                f"{field_name}[{row}] {arm_name} gripper openness is {openness[row, column]}, "
+                "expected [0, 1]"
+            )
 
     def _build_indices(self, trajectories):
         indices = []
